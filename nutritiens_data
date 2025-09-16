@@ -1,0 +1,48 @@
+-- ==============================
+-- NUTRITION NORMS
+-- ==============================
+CREATE TABLE NutritionNorms (
+    norm_id SERIAL PRIMARY KEY,
+    plant_id INT REFERENCES Plants(plant_id) ON DELETE CASCADE,
+    nutrient VARCHAR(10) NOT NULL,          -- N, P, K, etc.
+    min_value DECIMAL(6,2) NOT NULL,       -- Minimum optimal value
+    max_value DECIMAL(6,2) NOT NULL,       -- Maximum optimal value
+    unit VARCHAR(10),                       -- e.g., %, mg/kg, pH units
+    stage VARCHAR(50)                        -- Growth stage (optional)
+);
+
+-- ==============================
+-- Sample Data for Tomato, Wheat, Potato
+-- ==============================
+-- Tomato
+INSERT INTO NutritionNorms (plant_id, nutrient, min_value, max_value, unit, stage)
+VALUES
+(1, 'N', 40.0, 60.0, 'mg/kg', 'Vegetative'),
+(1, 'P', 12.0, 20.0, 'mg/kg', 'Vegetative'),
+(1, 'K', 35.0, 55.0, 'mg/kg', 'Vegetative'),
+(1, 'pH', 6.0, 6.8, 'pH', 'All'),
+(1, 'Moisture', 55.0, 65.0, '%', 'All'),
+(1, 'N', 50.0, 70.0, 'mg/kg', 'Fruiting'),
+(1, 'K', 45.0, 70.0, 'mg/kg', 'Fruiting');
+
+-- Wheat
+INSERT INTO NutritionNorms (plant_id, nutrient, min_value, max_value, unit, stage)
+VALUES
+(3, 'N', 30.0, 50.0, 'mg/kg', 'Tillering'),
+(3, 'P', 15.0, 25.0, 'mg/kg', 'Tillering'),
+(3, 'K', 25.0, 40.0, 'mg/kg', 'Tillering'),
+(3, 'pH', 6.0, 7.0, 'pH', 'All'),
+(3, 'Moisture', 50.0, 60.0, '%', 'All'),
+(3, 'N', 40.0, 60.0, 'mg/kg', 'Heading'),
+(3, 'K', 30.0, 45.0, 'mg/kg', 'Heading');
+
+-- Potato
+INSERT INTO NutritionNorms (plant_id, nutrient, min_value, max_value, unit, stage)
+VALUES
+(2, 'N', 50.0, 70.0, 'mg/kg', 'Vegetative'),
+(2, 'P', 18.0, 28.0, 'mg/kg', 'Vegetative'),
+(2, 'K', 40.0, 60.0, 'mg/kg', 'Vegetative'),
+(2, 'pH', 5.5, 6.5, 'pH', 'All'),
+(2, 'Moisture', 60.0, 70.0, '%', 'All'),
+(2, 'N', 55.0, 75.0, 'mg/kg', 'Tuberization'),
+(2, 'K', 50.0, 70.0, 'mg/kg', 'Tuberization');

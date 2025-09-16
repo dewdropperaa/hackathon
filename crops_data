@@ -1,0 +1,127 @@
+-- ==============================
+-- PLANTS
+-- ==============================
+CREATE TABLE Plants (
+    plant_id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE NOT NULL,
+    optimal_soil_ph DECIMAL(3,1) CHECK (optimal_soil_ph BETWEEN 4.0 AND 9.0),
+    optimal_moisture DECIMAL(4,1) CHECK (optimal_moisture BETWEEN 0 AND 100),
+    optimal_temp_range VARCHAR(20), -- e.g. "18-27°C"
+    growth_stages TEXT
+);
+
+INSERT INTO Plants (name, optimal_soil_ph, optimal_moisture, optimal_temp_range, growth_stages)
+VALUES
+('Tomato', 6.5, 60.0, '18-27°C', 'Germination, Vegetative, Flowering, Fruiting'),
+('Potato', 5.8, 70.0, '15-20°C', 'Sprouting, Vegetative, Tuberization, Maturity'),
+('Wheat', 6.0, 55.0, '12-25°C', 'Germination, Tillering, Heading, Ripening'),
+('Maize', 6.3, 65.0, '18-32°C', 'Germination, Vegetative, Reproductive, Maturity'),
+('Lettuce', 6.2, 65.0, '10-20°C', 'Germination, Leaf Development, Harvesting');
+
+
+-- ==============================
+-- SOIL READINGS
+-- ==============================
+CREATE TABLE SoilReadings (
+    reading_id SERIAL PRIMARY KEY,
+    plant_id INT REFERENCES Plants(plant_id) ON DELETE CASCADE,
+    timestamp TIMESTAMP NOT NULL,
+    soil_moisture DECIMAL(4,1) CHECK (soil_moisture BETWEEN 0 AND 100),
+    soil_ph DECIMAL(3,1) CHECK (soil_ph BETWEEN 4.0 AND 9.0),
+    soil_temperature DECIMAL(4,1),
+    nitrogen_level DECIMAL(5,1),
+    phosphorus_level DECIMAL(5,1),
+    potassium_level DECIMAL(5,1)
+);
+
+INSERT INTO SoilReadings (plant_id, timestamp, soil_moisture, soil_ph, soil_temperature, nitrogen_level, phosphorus_level, potassium_level)
+VALUES
+(1, NOW() - INTERVAL '1 day', 58.0, 6.4, 22.0, 45.0, 12.0, 30.0),
+(1, NOW(), 62.0, 6.6, 23.0, 50.0, 15.0, 32.0),
+(2, NOW(), 72.0, 5.9, 18.0, 60.0, 20.0, 35.0),
+(3, NOW(), 50.0, 6.1, 17.0, 40.0, 18.0, 25.0),
+(4, NOW(), 65.0, 6.3, 26.0, 55.0, 22.0, 40.0),
+(5, NOW(), 67.0, 6.2, 15.0, 35.0, 10.0, 20.0);
+
+
+-- ==============================
+-- IMAGE CAPTURES
+-- ==============================
+CREATE TABLE ImageCaptures (
+    image_id SERIAL PRIMARY KEY,
+    plant_id INT REFERENCES Plants(plant_id) ON DELETE CASCADE,
+    timestamp TIMESTAMP NOT NULL,
+    image_path VARCHAR(255),
+    leaf_color_status VARCHAR(20) CHECK (leaf_color_status IN ('healthy','yellowing','brown')),
+    anomaly_detected BOOLEAN DEFAULT FALSE
+);
+
+INSERT INTO ImageCaptures (plant_id, timestamp, image_path, leaf_color_status, anomaly_detected)
+VALUES
+(1, NOW(), '/images/tomato1.jpg', 'healthy', FALSE),
+(1, NOW() - INTERVAL '2 days', '/images/tomato2.jpg', 'yellowing', TRUE),
+(2, NOW(), '/images/potato1.jpg', 'healthy', FALSE),
+(3, NOW(), '/images/wheat1.jpg', 'brown', TRUE),
+(4, NOW(), '/images/maize1.jpg', 'yellowing', TRUE),
+(5, NOW(), '/images/lettuce1.jpg', 'healthy', FALSE);
+
+
+-- ==============================
+-- ALERTS
+-- ==============================
+CREATE TABLE Alerts (
+    alert_id SERIAL PRIMARY KEY,
+    plant_id INT REFERENCES Plants(plant_id) ON DELETE CASCADE,
+    timestamp TIMESTAMP NOT NULL,
+    alert_type VARCHAR(100),
+    severity VARCHAR(10) CHECK (severity IN ('low','medium','high')),
+    resolved BOOLEAN DEFAULT FALSE
+);
+
+INSERT INTO Alerts (plant_id, timestamp, alert_type, severity, resolved)
+VALUES
+(1, NOW(), 'Low Moisture', 'medium', FALSE),
+(1, NOW() - INTERVAL '2 days', 'Pest Suspected', 'high', FALSE),
+(2, NOW(), 'Low Nitrogen', 'low', TRUE),
+(3, NOW(), 'Disease Risk', 'high', FALSE),
+(4, NOW(), 'Nutrient Deficiency', 'medium', TRUE),
+(5, NOW(), 'Low Temperature', 'low', TRUE);
+
+
+-- ==============================
+-- FARMERS
+-- ==============================
+CREATE TABLE Farmers (
+    farmer_id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    location VARCHAR(100),
+    contact_info VARCHAR(100)
+);
+
+INSERT INTO Farmers (name, location, contact_info)
+VALUES
+('Ali Ben', 'Marrakech', 'ali@example.com'),
+('Sara K.', 'Casablanca', 'sara@example.com'),
+('Youssef L.', 'Rabat', 'youssef@example.com'),
+('Fatima Z.', 'Fès', 'fatima@example.com'),
+('Omar H.', 'Agadir', 'omar@example.com');
+
+
+-- ==============================
+-- PLANT ASSIGNMENTS
+-- ==============================
+CREATE TABLE PlantAssignments (
+    assignment_id SERIAL PRIMARY KEY,
+    farmer_id INT REFERENCES Farmers(farmer_id) ON DELETE CASCADE,
+    plant_id INT REFERENCES Plants(plant_id) ON DELETE CASCADE,
+    UNIQUE(farmer_id, plant_id)
+);
+
+INSERT INTO PlantAssignments (farmer_id, plant_id)
+VALUES
+(1, 1), -- Ali grows Tomato
+(1, 2), -- Ali grows Potato
+(2, 3), -- Sara grows Wheat
+(3, 4), -- Youssef grows Maize
+(4, 5), -- Fatima grows Lettuce
+(5, 1); -- Omar grows Tomato
