@@ -1,38 +1,48 @@
-import sys
 import os
 import json
 import base64
-from datetime import datetime
-from pathlib import Path
+import asyncio
+import aiohttp
 import cv2
 import time
+from datetime import datetime
+from pathlib import Path
+from flask import Flask, request, jsonify, send_file, render_template
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
+import numpy as np
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+import concurrent.futures
+import logging
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
 import threading
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QScrollArea, QFrame, QGridLayout,
-                             QProgressBar, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QMessageBox, QSplitter, QGroupBox, QTextEdit, QSpinBox, QCheckBox)
-from PyQt5.QtCore import Qt, QSize, QTimer, pyqtSignal, QThread, pyqtSlot
-from PyQt5.QtGui import QPixmap, QFont, QColor, QPalette, QIcon
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-import numpy as np
-import openai
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ==================== CONFIGURATION ====================
-# CAMERA SETTINGS - CHANGE CAPTURE INTERVAL HERE
-CAPTURE_INTERVAL = 60  # seconds between captures (60 = 1 minute)
-# For testing: CAPTURE_INTERVAL = 10  # 10 seconds for testing
+load_dotenv()  # Load variables from .env file
 
-# Poe API Configuration
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'fallback-key-for-development')
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['CAPTURES_FOLDER'] = 'captures'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+CORS(app)
+
+# Configuration
 POE_API_CONFIG = {
-    'api_key': 'ayUVKcP-GPAdMwlb3pmsX6K0ykLMX5D97oCxtTiqOVw',  # Replace with your actual API key
+    'api_key': os.getenv('POE_API_KEY'),
     'base_url': 'https://api.poe.com/v1',
-    'model': 'BotLPXCKK6G14'  # Your plant analysis bot
+    'model': 'BotLPXCKK6G14'
 }
 
-# Health thresholds
 HEALTH_THRESHOLDS = {
     'soil_moisture': {'min': 40, 'max': 70, 'unit': '%', 'description': 'Soil water content percentage'},
     'ph_level': {'min': 6.0, 'max': 7.5, 'unit': 'pH', 'description': 'Soil acidity/alkalinity level'},
@@ -44,495 +54,320 @@ HEALTH_THRESHOLDS = {
     'light_intensity': {'min': 200, 'max': 800, 'unit': 'μmol/m²/s', 'description': 'Light intensity for photosynthesis'}
 }
 
-class CameraThread(QThread):
-    """Thread to handle automatic camera capture"""
-    image_captured = pyqtSignal(str)  # Signal emits the path of captured image
-    capture_status = pyqtSignal(str)  # Signal for status updates
-    
-    def __init__(self, capture_interval=CAPTURE_INTERVAL):
-        super().__init__()
-        self.capture_interval = capture_interval
-        self.running = True
-        self.captures_folder = "captures"
-        self.create_captures_folder()
+# Thread pool for CPU-intensive tasks
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+# Global state (in production, use Redis or database)
+analysis_history = []
+current_analysis = None
+auto_capture_enabled = False
+auto_capture_thread = None
+auto_capture_interval = 300  # 5 minutes default
+
+# Ensure directories exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['CAPTURES_FOLDER'], exist_ok=True)
+
+# Camera functions integrated from camera.py
+def create_captures_folder():
+    """Create the captures folder if it doesn't exist."""
+    if not os.path.exists(app.config['CAPTURES_FOLDER']):
+        os.makedirs(app.config['CAPTURES_FOLDER'])
+        logger.info(f"Created '{app.config['CAPTURES_FOLDER']}' folder")
+
+def capture_image():
+    """Capture a single image from the webcam and return the filepath."""
+    cap = None
+    try:
+        # Try different camera indices
+        for camera_index in [0, 1, 2]:
+            cap = cv2.VideoCapture(camera_index)
+            if cap.isOpened():
+                logger.info(f"Camera found at index {camera_index}")
+                break
+            cap.release()
         
-    def create_captures_folder(self):
-        """Create the captures folder if it doesn't exist"""
-        if not os.path.exists(self.captures_folder):
-            os.makedirs(self.captures_folder)
-            
-    def set_capture_interval(self, interval):
-        """Update capture interval"""
-        self.capture_interval = interval
-        
-    def capture_image(self):
-        """Capture a single image from the webcam"""
-        cap = cv2.VideoCapture(0)
-        
-        if not cap.isOpened():
-            self.capture_status.emit("❌ Error: Could not open webcam")
+        if not cap or not cap.isOpened():
+            logger.error("Could not open any webcam")
             return None
         
-        # Set camera properties for better quality
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        # Allow camera to warm up
+        time.sleep(0.5)
         
+        # Read a frame from the webcam
         ret, frame = cap.read()
         
         if ret:
+            # Generate timestamp filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"plant_{timestamp}.jpg"
-            filepath = os.path.join(self.captures_folder, filename)
+            filepath = os.path.join(app.config['CAPTURES_FOLDER'], filename)
             
+            # Save the image
             cv2.imwrite(filepath, frame)
-            cap.release()
+            logger.info(f"Captured image: {filename}")
             
-            self.capture_status.emit(f"📸 Captured: {filename}")
             return filepath
         else:
-            cap.release()
-            self.capture_status.emit("❌ Error: Failed to capture image")
+            logger.error("Failed to capture image - no frame received")
             return None
             
-    def run(self):
-        """Main thread loop"""
-        while self.running:
-            filepath = self.capture_image()
-            if filepath:
-                self.image_captured.emit(filepath)
+    except Exception as e:
+        logger.error(f"Error in capture_image: {str(e)}")
+        return None
+    finally:
+        if cap:
+            cap.release()
+
+def auto_capture_loop():
+    """Auto-capture loop running in background thread."""
+    global auto_capture_enabled, auto_capture_interval
+    
+    logger.info(f"Auto-capture started with interval: {auto_capture_interval} seconds")
+    
+    while auto_capture_enabled:
+        try:
+            # Capture an image
+            image_path = capture_image()
+            
+            if image_path:
+                # Process the captured image
+                process_image(image_path)
+                
+                # Emit event for new capture
+                socketio.emit('auto_capture', {
+                    'image_path': image_path,
+                    'timestamp': datetime.now().isoformat()
+                })
             
             # Wait for the specified interval
-            for _ in range(self.capture_interval):
-                if not self.running:
+            for _ in range(auto_capture_interval):
+                if not auto_capture_enabled:
                     break
                 time.sleep(1)
                 
-    def stop(self):
-        """Stop the camera thread"""
-        self.running = False
-        self.wait()
-
-class ModernMetricCard(QWidget):
-    """Modern metric display card"""
-    def __init__(self, name, value, threshold, parent=None):
-        super().__init__(parent)
-        self.name = name
-        self.value = value
-        self.threshold = threshold
-        
-        self.setFixedHeight(120)
-        self.setup_ui()
-        
-    def setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(8)
-        
-        # Metric name
-        name_label = QLabel(self.name.replace('_', ' ').title())
-        name_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        name_label.setStyleSheet("color: #2c3e50;")
-        layout.addWidget(name_label)
-        
-        # Value
-        value_label = QLabel(f"{self.value} {self.threshold['unit']}")
-        value_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        layout.addWidget(value_label)
-        
-        # Range indicator
-        range_label = QLabel(f"Normal: {self.threshold['min']}-{self.threshold['max']} {self.threshold['unit']}")
-        range_label.setFont(QFont("Segoe UI", 9))
-        range_label.setStyleSheet("color: #7f8c8d;")
-        layout.addWidget(range_label)
-        
-        # Status indicator
-        status_widget = QWidget()
-        status_widget.setFixedHeight(6)
-        
-        # Determine status color
-        if self.value < self.threshold['min'] * 0.8 or self.value > self.threshold['max'] * 1.2:
-            color = "#e74c3c"  # Red - Critical
-            value_label.setStyleSheet("color: #e74c3c;")
-        elif self.value >= self.threshold['min'] and self.value <= self.threshold['max']:
-            color = "#27ae60"  # Green - Normal
-            value_label.setStyleSheet("color: #27ae60;")
-        else:
-            color = "#f39c12"  # Orange - Warning
-            value_label.setStyleSheet("color: #f39c12;")
-            
-        status_widget.setStyleSheet(f"background-color: {color}; border-radius: 3px;")
-        layout.addWidget(status_widget)
-        
-        self.setLayout(layout)
-        self.setStyleSheet("""
-            QWidget {
-                background-color: white;
-                border-radius: 12px;
-                border: 1px solid #e1e5e9;
-            }
-            QWidget:hover {
-                border: 1px solid #3498db;
-                box-shadow: 0 4px 12px rgba(52, 152, 219, 0.15);
-            }
-        """)
-
-class ModernImageDisplay(QLabel):
-    """Modern image display widget"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAlignment(Qt.AlignCenter)
-        self.setText("📷 Waiting for first capture...")
-        self.setMinimumSize(300, 200)
-        self.setStyleSheet("""
-            QLabel {
-                background-color: #f8f9fa;
-                border: 2px dashed #dee2e6;
-                border-radius: 12px;
-                color: #6c757d;
-                font-size: 14px;
-                font-weight: 500;
-            }
-        """)
-        
-    def set_image(self, image_path):
-        """Set and display the image"""
-        try:
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
-                scaled_pixmap = pixmap.scaled(
-                    self.width() - 20, self.height() - 20, 
-                    Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                self.setPixmap(scaled_pixmap)
-                self.setStyleSheet("""
-                    QLabel {
-                        background-color: white;
-                        border: 1px solid #e1e5e9;
-                        border-radius: 12px;
-                    }
-                """)
-            else:
-                self.setText("❌ Failed to load image")
         except Exception as e:
-            self.setText(f"❌ Error loading image: {str(e)}")
-
-class ModernDashboard(QMainWindow):
-    """Modern Plant Health Dashboard"""
+            logger.error(f"Error in auto-capture loop: {str(e)}")
+            time.sleep(30)  # Wait before retrying
     
-    def __init__(self):
-        super().__init__()
-        self.analysis_history = []
-        self.current_analysis = None
-        self.camera_thread = None
+    logger.info("Auto-capture stopped")
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/camera/capture', methods=['POST'])
+def capture_from_camera():
+    """Capture image from webcam"""
+    try:
+        image_path = capture_image()
         
-        # Initialize OpenAI client for Poe API
-        self.poe_client = openai.OpenAI(
-            api_key=POE_API_CONFIG['api_key'],
-            base_url=POE_API_CONFIG['base_url'],
-        )
+        if not image_path:
+            return jsonify({'error': 'Failed to capture image from camera. Check if camera is connected and accessible.'}), 500
         
-        self.init_ui()
-        self.apply_modern_theme()
-        self.start_camera_capture()
+        # Process image in background
+        executor.submit(process_image, image_path)
         
-    def init_ui(self):
-        """Initialize the modern UI"""
-        self.setWindowTitle("🌱 Plant Health Dashboard")
-        self.setGeometry(100, 100, 1600, 900)
+        return jsonify({
+            'success': True, 
+            'image_path': image_path,
+            'message': 'Image captured successfully'
+        })
+    
+    except Exception as e:
+        logger.error(f"Error capturing from camera: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/camera/auto-capture', methods=['POST'])
+def toggle_auto_capture():
+    """Enable or disable auto-capture"""
+    global auto_capture_enabled, auto_capture_thread, auto_capture_interval
+    
+    try:
+        data = request.json
+        enabled = data.get('enabled', False)
+        interval = data.get('interval', 300)
         
-        # Central widget
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        # Update interval if provided
+        if interval and interval >= 10:  # Minimum 10 seconds
+            auto_capture_interval = interval
         
-        # Main layout
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(20)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        # Start or stop auto-capture
+        if enabled and not auto_capture_enabled:
+            auto_capture_enabled = True
+            auto_capture_thread = threading.Thread(target=auto_capture_loop, daemon=True)
+            auto_capture_thread.start()
+            message = f"Auto-capture enabled with {auto_capture_interval} second interval"
+        elif not enabled and auto_capture_enabled:
+            auto_capture_enabled = False
+            if auto_capture_thread and auto_capture_thread.is_alive():
+                auto_capture_thread.join(timeout=5.0)
+            message = "Auto-capture disabled"
+        else:
+            message = f"Auto-capture is already {'enabled' if enabled else 'disabled'}"
         
-        # Left panel - Camera and Controls
-        left_panel = self.create_left_panel()
-        left_panel.setMaximumWidth(400)
+        return jsonify({
+            'success': True, 
+            'enabled': auto_capture_enabled,
+            'interval': auto_capture_interval,
+            'message': message
+        })
+    
+    except Exception as e:
+        logger.error(f"Error toggling auto-capture: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/camera/status', methods=['GET'])
+def get_camera_status():
+    """Get camera and auto-capture status"""
+    return jsonify({
+        'auto_capture_enabled': auto_capture_enabled,
+        'auto_capture_interval': auto_capture_interval,
+        'camera_available': is_camera_available()
+    })
+
+def is_camera_available():
+    """Check if camera is available"""
+    cap = cv2.VideoCapture(0)
+    available = cap.isOpened()
+    cap.release()
+    return available
+
+@app.route('/api/capture', methods=['POST'])
+async def capture_image_endpoint():
+    """Capture image from uploaded file"""
+    try:
+        # For web app, we'll receive images from the client
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image provided'}), 400
         
-        # Right panel - Analysis Results
-        right_panel = self.create_right_panel()
+        image_file = request.files['image']
+        if image_file.filename == '':
+            return jsonify({'error': 'No image selected'}), 400
         
-        # Add to main layout
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(right_panel, stretch=2)
+        # Save the uploaded image
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"plant_{timestamp}_{secure_filename(image_file.filename)}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        image_file.save(filepath)
         
-        # Status bar
-        self.statusBar().showMessage("🚀 Dashboard initialized - Starting camera...")
+        # Process image in background
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, process_image, filepath)
         
-    def create_left_panel(self):
-        """Create the left control panel"""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(20)
+        return jsonify({'success': True, 'image_path': filepath})
+    
+    except Exception as e:
+        logger.error(f"Error capturing image: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+def process_image(filepath):
+    """Process image and trigger analysis"""
+    try:
+        # Optimize image for web (resize, compress)
+        img = cv2.imread(filepath)
+        if img is None:
+            logger.error(f"Failed to read image: {filepath}")
+            return
         
-        # Camera preview
-        camera_group = QGroupBox("📷 Live Plant Monitor")
-        camera_layout = QVBoxLayout(camera_group)
+        # Resize if too large
+        height, width = img.shape[:2]
+        if width > 1200:
+            scale = 1200 / width
+            new_width = 1200
+            new_height = int(height * scale)
+            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # Save optimized version
+            cv2.imwrite(filepath, img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         
-        self.image_display = ModernImageDisplay()
-        camera_layout.addWidget(self.image_display)
-        
-        layout.addWidget(camera_group)
-        
-        # Camera controls
-        controls_group = QGroupBox("⚙️ Camera Settings")
-        controls_layout = QVBoxLayout(controls_group)
-        
-        # Capture interval setting
-        interval_layout = QHBoxLayout()
-        interval_label = QLabel("Capture Interval (seconds):")
-        self.interval_spinbox = QSpinBox()
-        self.interval_spinbox.setRange(5, 3600)  # 5 seconds to 1 hour
-        self.interval_spinbox.setValue(CAPTURE_INTERVAL)
-        self.interval_spinbox.valueChanged.connect(self.update_capture_interval)
-        
-        interval_layout.addWidget(interval_label)
-        interval_layout.addWidget(self.interval_spinbox)
-        controls_layout.addLayout(interval_layout)
-        
-        # Auto-analysis toggle
-        self.auto_analyze_checkbox = QCheckBox("Auto-analyze new captures")
-        self.auto_analyze_checkbox.setChecked(True)
-        controls_layout.addWidget(self.auto_analyze_checkbox)
-        
-        # Manual analyze button
-        self.analyze_btn = QPushButton("🔍 Analyze Current Image")
-        self.analyze_btn.clicked.connect(self.analyze_current_image)
-        self.analyze_btn.setEnabled(False)
-        controls_layout.addWidget(self.analyze_btn)
-        
-        layout.addWidget(controls_group)
-        
-        # Analysis history
-        history_group = QGroupBox("📊 Analysis History")
-        history_layout = QVBoxLayout(history_group)
-        
-        self.history_table = QTableWidget()
-        self.history_table.setColumnCount(3)
-        self.history_table.setHorizontalHeaderLabels(["Time", "Score", "Status"])
-        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.history_table.setMaximumHeight(200)
-        self.history_table.doubleClicked.connect(self.view_history_item)
-        
-        history_layout.addWidget(self.history_table)
-        layout.addWidget(history_group)
-        
-        layout.addStretch()
-        return panel
-        
-    def create_right_panel(self):
-        """Create the right analysis panel"""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        
-        # Header
-        header = QLabel("🌿 Plant Health Analysis")
-        header.setFont(QFont("Segoe UI", 20, QFont.Bold))
-        header.setStyleSheet("color: #2c3e50; margin-bottom: 10px;")
-        layout.addWidget(header)
-        
-        # Health score display
-        self.health_score_widget = self.create_health_score_widget()
-        layout.addWidget(self.health_score_widget)
-        
-        # Metrics grid
-        self.metrics_container = QWidget()
-        self.metrics_layout = QGridLayout(self.metrics_container)
-        self.metrics_layout.setSpacing(15)
-        layout.addWidget(self.metrics_container)
-        
-        # Analysis report
-        report_group = QGroupBox("📋 Detailed Analysis")
-        report_layout = QVBoxLayout(report_group)
-        
-        self.analysis_text = QTextEdit()
-        self.analysis_text.setReadOnly(True)
-        self.analysis_text.setMaximumHeight(150)
-        self.analysis_text.setPlainText("Waiting for first analysis...")
-        report_layout.addWidget(self.analysis_text)
-        
-        layout.addWidget(report_group)
-        
-        # Recommendations
-        rec_group = QGroupBox("💡 Recommendations")
-        rec_layout = QVBoxLayout(rec_group)
-        
-        self.recommendations_text = QTextEdit()
-        self.recommendations_text.setReadOnly(True)
-        self.recommendations_text.setMaximumHeight(120)
-        self.recommendations_text.setPlainText("Analysis recommendations will appear here...")
-        rec_layout.addWidget(self.recommendations_text)
-        
-        layout.addWidget(rec_group)
-        
-        return panel
-        
-    def create_health_score_widget(self):
-        """Create the health score display widget"""
-        widget = QWidget()
-        widget.setFixedHeight(100)
-        layout = QHBoxLayout(widget)
-        
-        # Score circle (simplified as text for now)
-        score_container = QWidget()
-        score_container.setFixedSize(80, 80)
-        score_layout = QVBoxLayout(score_container)
-        score_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.health_score_label = QLabel("--")
-        self.health_score_label.setFont(QFont("Segoe UI", 24, QFont.Bold))
-        self.health_score_label.setAlignment(Qt.AlignCenter)
-        self.health_score_label.setStyleSheet("color: #7f8c8d;")
-        score_layout.addWidget(self.health_score_label)
-        
-        score_text = QLabel("Health Score")
-        score_text.setFont(QFont("Segoe UI", 10))
-        score_text.setAlignment(Qt.AlignCenter)
-        score_text.setStyleSheet("color: #7f8c8d;")
-        score_layout.addWidget(score_text)
-        
-        # Status text
-        self.status_label = QLabel("Waiting for analysis...")
-        self.status_label.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        self.status_label.setStyleSheet("color: #7f8c8d;")
-        
-        layout.addWidget(score_container)
-        layout.addWidget(self.status_label)
-        layout.addStretch()
-        
-        widget.setStyleSheet("""
-            QWidget {
-                background-color: white;
-                border-radius: 12px;
-                border: 1px solid #e1e5e9;
-                margin-bottom: 20px;
-            }
-        """)
-        
-        return widget
-        
-    def apply_modern_theme(self):
-        """Apply modern theme to the application"""
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f8f9fa;
-            }
-            QGroupBox {
-                font-weight: bold;
-                font-size: 12px;
-                color: #2c3e50;
-                border: 1px solid #e1e5e9;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 10px;
-                background-color: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 15px;
-                padding: 0 8px 0 8px;
-                background-color: white;
-            }
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 12px;
-                font-weight: bold;
-                font-size: 11px;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-            QPushButton:pressed {
-                background-color: #21618c;
-            }
-            QPushButton:disabled {
-                background-color: #bdc3c7;
-            }
-            QTextEdit {
-                border: 1px solid #e1e5e9;
-                border-radius: 8px;
-                background-color: #f8f9fa;
-                padding: 10px;
-            }
-            QSpinBox {
-                border: 1px solid #e1e5e9;
-                border-radius: 6px;
-                padding: 8px;
-                background-color: white;
-            }
-            QCheckBox {
-                font-weight: 500;
-                color: #2c3e50;
-            }
-            QTableWidget {
-                border: 1px solid #e1e5e9;
-                border-radius: 8px;
-                background-color: white;
-                gridline-color: #f1f3f4;
-            }
-            QHeaderView::section {
-                background-color: #f8f9fa;
-                padding: 8px;
-                border: 1px solid #e1e5e9;
-                font-weight: bold;
-            }
-        """)
-        
-    def start_camera_capture(self):
-        """Start the automatic camera capture"""
-        self.camera_thread = CameraThread(CAPTURE_INTERVAL)
-        self.camera_thread.image_captured.connect(self.on_image_captured)
-        self.camera_thread.capture_status.connect(self.on_capture_status)
-        self.camera_thread.start()
-        
-    @pyqtSlot(str)
-    def on_image_captured(self, image_path):
-        """Handle new image capture"""
-        self.image_display.set_image(image_path)
-        self.current_image_path = image_path
-        self.analyze_btn.setEnabled(True)
+        # Emit event for new image
+        socketio.emit('image_captured', {
+            'image_path': filepath,
+            'timestamp': datetime.now().isoformat()
+        })
         
         # Auto-analyze if enabled
-        if self.auto_analyze_checkbox.isChecked():
-            self.analyze_current_image()
-            
-    @pyqtSlot(str)  
-    def on_capture_status(self, status):
-        """Handle capture status updates"""
-        self.statusBar().showMessage(status)
+        socketio.emit('analysis_started', {'message': 'Starting analysis...'})
+        analyze_image(filepath)
         
-    def update_capture_interval(self, interval):
-        """Update the camera capture interval"""
-        if self.camera_thread:
-            self.camera_thread.set_capture_interval(interval)
-            self.statusBar().showMessage(f"📷 Capture interval updated to {interval} seconds")
-            
-    def analyze_current_image(self):
-        """Analyze the current image using Poe API"""
-        if not hasattr(self, 'current_image_path'):
-            QMessageBox.warning(self, "No Image", "No image available for analysis.")
-            return
-            
-        self.statusBar().showMessage("🔍 Analyzing plant health...")
-        self.analyze_btn.setEnabled(False)
+    except Exception as e:
+        logger.error(f"Error processing image: {str(e)}")
+        socketio.emit('analysis_error', {'error': str(e)})
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_image_endpoint():
+    """API endpoint to trigger image analysis"""
+    try:
+        data = request.json
+        image_path = data.get('image_path')
         
-        try:
-            # Convert image to base64 for API
-            with open(self.current_image_path, 'rb') as img_file:
-                img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+        if not image_path or not os.path.exists(image_path):
+            return jsonify({'error': 'Invalid image path'}), 400
+        
+        # Run analysis in background
+        executor.submit(analyze_image, image_path)
+        
+        return jsonify({'success': True, 'message': 'Analysis started'})
+    
+    except Exception as e:
+        logger.error(f"Error starting analysis: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+def analyze_image(image_path):
+    """Analyze plant image using Poe API"""
+    try:
+        # Convert image to base64
+        with open(image_path, 'rb') as img_file:
+            img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+        
+        # Call Poe API asynchronously
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        analysis_data = loop.run_until_complete(call_poe_api(img_base64))
+        
+        # Generate mock sensor data
+        sensor_data = generate_mock_sensor_data()
+        
+        # Create complete analysis
+        complete_analysis = {
+            "timestamp": datetime.now().isoformat(),
+            "image_path": image_path,
+            "plant_analysis": analysis_data,
+            "sensor_data": sensor_data
+        }
+        
+        # Update global state
+        global current_analysis, analysis_history
+        current_analysis = complete_analysis
+        analysis_history.append(complete_analysis)
+        
+        # Keep only last 50 analyses
+        if len(analysis_history) > 50:
+            analysis_history = analysis_history[-50:]
+        
+        # Emit analysis results
+        socketio.emit('analysis_complete', complete_analysis)
+        
+        # Check for alerts
+        check_for_alerts(complete_analysis)
+        
+    except Exception as e:
+        logger.error(f"Error analyzing image: {str(e)}")
+        socketio.emit('analysis_error', {'error': str(e)})
+
+async def call_poe_api(image_base64):
+    """Call Poe API asynchronously"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                'Authorization': f'Bearer {POE_API_CONFIG["api_key"]}',
+                'Content-Type': 'application/json'
+            }
             
-            # Call Poe API
-            response = self.poe_client.chat.completions.create(
-                model=POE_API_CONFIG['model'],
-                messages=[
+            payload = {
+                "model": POE_API_CONFIG['model'],
+                "messages": [
                     {
                         "role": "user",
                         "content": [
@@ -543,190 +378,266 @@ class ModernDashboard(QMainWindow):
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:image/jpeg;base64,{img_base64}"
+                                    "url": f"data:image/jpeg;base64,{image_base64}"
                                 }
                             }
                         ]
                     }
                 ]
-            )
-            
-            # Parse response
-            analysis_text = response.choices[0].message.content
-            
-            # Try to parse JSON, fallback to text parsing
-            try:
-                import json
-                analysis_data = json.loads(analysis_text)
-            except:
-                # Fallback parsing
-                analysis_data = {
-                    "health_score": 75,  # Default score
-                    "analysis": analysis_text,
-                    "recommendations": ["Monitor plant regularly", "Ensure proper watering"],
-                    "issues_detected": []
-                }
-            
-            # Generate mock sensor data (replace with actual sensor integration)
-            sensor_data = self.generate_mock_sensor_data()
-            
-            # Create complete analysis
-            complete_analysis = {
-                "timestamp": datetime.now().isoformat(),
-                "image_path": self.current_image_path,
-                "plant_analysis": analysis_data,
-                "sensor_data": sensor_data
             }
             
-            self.current_analysis = complete_analysis
-            self.analysis_history.append(complete_analysis)
-            
-            # Update UI
-            self.update_dashboard()
-            self.update_history_table()
-            
-            self.statusBar().showMessage("✅ Analysis completed successfully!")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Analysis Error", f"Failed to analyze image: {str(e)}")
-            self.statusBar().showMessage("❌ Analysis failed")
-            
-        finally:
-            self.analyze_btn.setEnabled(True)
-            
-    def generate_mock_sensor_data(self):
-        """Generate mock sensor data (replace with actual sensor integration)"""
-        import random
+            async with session.post(
+                f"{POE_API_CONFIG['base_url']}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    analysis_text = result['choices'][0]['message']['content']
+                    
+                    # Try to parse JSON
+                    try:
+                        return json.loads(analysis_text)
+                    except json.JSONDecodeError:
+                        # Fallback parsing
+                        return {
+                            "health_score": 75,
+                            "analysis": analysis_text,
+                            "recommendations": ["Monitor plant regularly", "Ensure proper watering"],
+                            "issues_detected": []
+                        }
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Poe API error: {response.status} - {error_text}")
+                    raise Exception(f"API error: {response.status}")
+                    
+    except Exception as e:
+        logger.error(f"Error calling Poe API: {str(e)}")
+        # Return fallback data
         return {
-            "soil_moisture": round(random.uniform(45, 65), 1),
-            "ph_level": round(random.uniform(6.2, 7.2), 1),
-            "nitrogen": round(random.uniform(18, 35), 1),
-            "phosphorus": round(random.uniform(6, 14), 1),
-            "potassium": round(random.uniform(35, 55), 1),
-            "temperature": round(random.uniform(20, 24), 1),
-            "humidity": round(random.uniform(55, 75), 1),
-            "light_intensity": round(random.uniform(300, 600), 0)
+            "health_score": 75,
+            "analysis": f"Analysis failed: {str(e)}",
+            "recommendations": ["Check connection and try again"],
+            "issues_detected": ["Analysis error"]
         }
+
+def generate_mock_sensor_data():
+    """Generate mock sensor data"""
+    import random
+    return {
+        "soil_moisture": round(random.uniform(45, 65), 1),
+        "ph_level": round(random.uniform(6.2, 7.2), 1),
+        "nitrogen": round(random.uniform(18, 35), 1),
+        "phosphorus": round(random.uniform(6, 14), 1),
+        "potassium": round(random.uniform(35, 55), 1),
+        "temperature": round(random.uniform(20, 24), 1),
+        "humidity": round(random.uniform(55, 75), 1),
+        "light_intensity": round(random.uniform(300, 600), 0)
+    }
+
+def check_for_alerts(analysis):
+    """Check analysis results for alerts"""
+    try:
+        health_score = analysis['plant_analysis'].get('health_score', 0)
+        issues = analysis['plant_analysis'].get('issues_detected', [])
+        sensor_data = analysis['sensor_data']
         
-    def update_dashboard(self):
-        """Update dashboard with current analysis"""
-        if not self.current_analysis:
-            return
-            
-        analysis = self.current_analysis['plant_analysis']
-        sensor_data = self.current_analysis['sensor_data']
+        alerts = []
         
-        # Update health score
-        health_score = analysis.get('health_score', 0)
-        self.health_score_label.setText(str(health_score))
+        # Health score alert
+        if health_score < 60:
+            alerts.append({
+                'type': 'critical',
+                'message': f'Low health score: {health_score}/100',
+                'timestamp': datetime.now().isoformat()
+            })
         
-        # Update status and colors
-        if health_score >= 80:
-            self.health_score_label.setStyleSheet("color: #27ae60;")
-            self.status_label.setText("Excellent Health")
-            self.status_label.setStyleSheet("color: #27ae60;")
-        elif health_score >= 60:
-            self.health_score_label.setStyleSheet("color: #f39c12;")
-            self.status_label.setText("Good Health")
-            self.status_label.setStyleSheet("color: #f39c12;")
-        else:
-            self.health_score_label.setStyleSheet("color: #e74c3c;")
-            self.status_label.setText("Needs Attention")
-            self.status_label.setStyleSheet("color: #e74c3c;")
-            
-        # Update metrics grid
-        self.clear_metrics()
-        row, col = 0, 0
+        # Sensor data alerts
         for metric, value in sensor_data.items():
             if metric in HEALTH_THRESHOLDS:
-                metric_card = ModernMetricCard(metric, value, HEALTH_THRESHOLDS[metric])
-                self.metrics_layout.addWidget(metric_card, row, col)
-                col += 1
-                if col > 2:  # 3 columns
-                    col = 0
-                    row += 1
-                    
-        # Update analysis text
-        self.analysis_text.setPlainText(analysis.get('analysis', 'No analysis available'))
+                threshold = HEALTH_THRESHOLDS[metric]
+                if value < threshold['min'] or value > threshold['max']:
+                    alerts.append({
+                        'type': 'warning' if 0.8 * threshold['min'] <= value <= 1.2 * threshold['max'] else 'critical',
+                        'message': f'{metric.replace("_", " ").title()} is out of range: {value} {threshold["unit"]} (normal: {threshold["min"]}-{threshold["max"]})',
+                        'timestamp': datetime.now().isoformat()
+                    })
         
-        # Update recommendations
-        recommendations = analysis.get('recommendations', [])
-        if recommendations:
-            rec_text = "\n".join([f"• {rec}" for rec in recommendations])
-        else:
-            rec_text = "No specific recommendations at this time."
-        self.recommendations_text.setPlainText(rec_text)
+        # Issue alerts
+        for issue in issues:
+            alerts.append({
+                'type': 'critical',
+                'message': f'Detected issue: {issue}',
+                'timestamp': datetime.now().isoformat()
+            })
         
-    def clear_metrics(self):
-        """Clear existing metric widgets"""
-        while self.metrics_layout.count():
-            child = self.metrics_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-                
-    def update_history_table(self):
-        """Update the history table"""
-        self.history_table.setRowCount(min(len(self.analysis_history), 10))  # Show last 10
-        
-        for i, analysis in enumerate(reversed(self.analysis_history[-10:])):
-            timestamp = datetime.fromisoformat(analysis['timestamp']).strftime("%H:%M:%S")
-            health_score = analysis['plant_analysis'].get('health_score', 0)
+        # Send alerts if any
+        if alerts:
+            socketio.emit('alerts', alerts)
             
-            self.history_table.setItem(i, 0, QTableWidgetItem(timestamp))
-            self.history_table.setItem(i, 1, QTableWidgetItem(str(health_score)))
-            
-            # Status with color
-            status_item = QTableWidgetItem()
-            if health_score >= 80:
-                status_item.setText("Excellent")
-                status_item.setForeground(QColor(39, 174, 96))
-            elif health_score >= 60:
-                status_item.setText("Good")  
-                status_item.setForeground(QColor(243, 156, 18))
-            else:
-                status_item.setText("Poor")
-                status_item.setForeground(QColor(231, 76, 60))
-                
-            self.history_table.setItem(i, 2, status_item)
-            
-    def view_history_item(self, index):
-        """View a historical analysis"""
-        row = index.row()
-        if row < len(self.analysis_history):
-            # Get the analysis (accounting for reversed display)
-            analysis_index = len(self.analysis_history) - 1 - row
-            self.current_analysis = self.analysis_history[analysis_index]
-            
-            # Update image display
-            if os.path.exists(self.current_analysis['image_path']):
-                self.image_display.set_image(self.current_analysis['image_path'])
-            
-            # Update dashboard
-            self.update_dashboard()
-            
-    def closeEvent(self, event):
-        """Handle application close"""
-        if self.camera_thread:
-            self.camera_thread.stop()
-        event.accept()
+    except Exception as e:
+        logger.error(f"Error checking alerts: {str(e)}")
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
+@app.route('/api/report/pdf', methods=['POST'])
+def generate_pdf_report():
+    """Generate PDF report"""
+    try:
+        data = request.json
+        analysis_id = data.get('analysis_id')
+        
+        # Find analysis (in production, use database)
+        global analysis_history
+        analysis = None
+        
+        if analysis_id == 'current' and current_analysis:
+            analysis = current_analysis
+        else:
+            for a in analysis_history:
+                if a.get('id') == analysis_id:
+                    analysis = a
+                    break
+        
+        if not analysis:
+            return jsonify({'error': 'Analysis not found'}), 404
+        
+        # Generate PDF in background thread
+        pdf_path = executor.submit(create_pdf_report, analysis).result()
+        
+        return send_file(pdf_path, as_attachment=True, download_name='plant_health_report.pdf')
     
-    # Set modern application properties
-    app.setApplicationName("Plant Health Dashboard")
-    app.setApplicationVersion("2.0")
-    app.setStyle("Fusion")  # Modern fusion style
-    
-    # Apply modern palette
-    palette = QPalette()
-    palette.setColor(QPalette.Window, QColor(248, 249, 250))
-    palette.setColor(QPalette.WindowText, QColor(44, 62, 80))
-    palette.setColor(QPalette.Base, QColor(255, 255, 255))
-    palette.setColor(QPalette.AlternateBase, QColor(241, 243, 244))
-    app.setPalette(palette)
-    
-    dashboard = ModernDashboard()
-    dashboard.show()
-    
-    sys.exit(app.exec_())
+    except Exception as e:
+        logger.error(f"Error generating PDF: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+def create_pdf_report(analysis):
+    """Create PDF report using ReportLab"""
+    try:
+        # Create PDF document
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"reports/plant_report_{timestamp}.pdf"
+        os.makedirs('reports', exist_ok=True)
+        
+        doc = SimpleDocTemplate(filename, pagesize=letter)
+        styles = getSampleStyleSheet()
+        elements = []
+        
+        # Title
+        title_style = ParagraphStyle(
+            'Title',
+            parent=styles['Heading1'],
+            fontSize=20,
+            spaceAfter=30,
+            alignment=1  # Center
+        )
+        elements.append(Paragraph("Plant Health Analysis Report", title_style))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Timestamp
+        timestamp_str = datetime.fromisoformat(analysis['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
+        elements.append(Paragraph(f"Analysis Date: {timestamp_str}", styles['Normal']))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Health Score
+        health_score = analysis['plant_analysis'].get('health_score', 0)
+        score_style = ParagraphStyle(
+            'Score',
+            parent=styles['Heading2'],
+            fontSize=16,
+            textColor=colors.green if health_score >= 80 else 
+                     colors.orange if health_score >= 60 else colors.red
+        )
+        elements.append(Paragraph(f"Health Score: {health_score}/100", score_style))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Sensor Data Table
+        sensor_data = analysis['sensor_data']
+        sensor_table_data = [['Parameter', 'Value', 'Normal Range', 'Status']]
+        
+        for metric, value in sensor_data.items():
+            if metric in HEALTH_THRESHOLDS:
+                threshold = HEALTH_THRESHOLDS[metric]
+                normal_range = f"{threshold['min']}-{threshold['max']} {threshold['unit']}"
+                
+                if value < threshold['min'] * 0.8 or value > threshold['max'] * 1.2:
+                    status = "Critical"
+                    color = colors.red
+                elif value >= threshold['min'] and value <= threshold['max']:
+                    status = "Normal"
+                    color = colors.green
+                else:
+                    status = "Warning"
+                    color = colors.orange
+                
+                sensor_table_data.append([
+                    metric.replace('_', ' ').title(),
+                    f"{value} {threshold['unit']}",
+                    normal_range,
+                    status
+                ])
+        
+        sensor_table = Table(sensor_table_data, colWidths=[1.5*inch, 1.2*inch, 1.8*inch, 1*inch])
+        sensor_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        elements.append(sensor_table)
+        elements.append(Spacer(1, 0.3*inch))
+        
+        # Analysis
+        elements.append(Paragraph("Analysis", styles['Heading2']))
+        analysis_text = analysis['plant_analysis'].get('analysis', 'No analysis available.')
+        elements.append(Paragraph(analysis_text, styles['Normal']))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Recommendations
+        elements.append(Paragraph("Recommendations", styles['Heading2']))
+        recommendations = analysis['plant_analysis'].get('recommendations', [])
+        if recommendations:
+            for rec in recommendations:
+                elements.append(Paragraph(f"• {rec}", styles['Normal']))
+        else:
+            elements.append(Paragraph("No specific recommendations at this time.", styles['Normal']))
+        
+        # Build PDF
+        doc.build(elements)
+        return filename
+        
+    except Exception as e:
+        logger.error(f"Error creating PDF: {str(e)}")
+        raise
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    """Get analysis history"""
+    try:
+        # Return last 10 analyses
+        return jsonify({'history': analysis_history[-10:]})
+    except Exception as e:
+        logger.error(f"Error getting history: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@socketio.on('connect')
+def handle_connect():
+    logger.info('Client connected')
+    emit('connected', {'message': 'Connected to Plant Health Dashboard'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    logger.info('Client disconnected')
+
+if __name__ == '__main__':
+    # Create necessary directories
+    create_captures_folder()
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
