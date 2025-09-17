@@ -1,32 +1,38 @@
 import sys
 import os
 import json
-import requests
+import base64
 from datetime import datetime
 from pathlib import Path
+import cv2
+import time
+import threading
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QFileDialog, QScrollArea, QFrame, QGridLayout,
+                             QLabel, QPushButton, QScrollArea, QFrame, QGridLayout,
                              QProgressBar, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QMessageBox, QSplitter, QGroupBox, QTextEdit, QComboBox, QLineEdit)
-from PyQt5.QtCore import Qt, QSize, QTimer, pyqtSignal
+                             QMessageBox, QSplitter, QGroupBox, QTextEdit, QSpinBox, QCheckBox)
+from PyQt5.QtCore import Qt, QSize, QTimer, pyqtSignal, QThread, pyqtSlot
 from PyQt5.QtGui import QPixmap, QFont, QColor, QPalette, QIcon
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import numpy as np
+import openai
 
-# Configuration - Replace with your actual Poe API details
+# ==================== CONFIGURATION ====================
+# CAMERA SETTINGS - CHANGE CAPTURE INTERVAL HERE
+CAPTURE_INTERVAL = 60  # seconds between captures (60 = 1 minute)
+# For testing: CAPTURE_INTERVAL = 10  # 10 seconds for testing
+
+# Poe API Configuration
 POE_API_CONFIG = {
-    'base_url': 'https://api.poe.com/bot/',
-    'api_key': 'your-poe-api-key-here',
-    'bots': {
-        'plant_health_analyzer': 'your-plant-health-bot-name',
-        'sensor_data_analyzer': 'your-sensor-bot-name'
-    }
+    'api_key': 'ayUVKcP-GPAdMwlb3pmsX6K0ykLMX5D97oCxtTiqOVw',  # Replace with your actual API key
+    'base_url': 'https://api.poe.com/v1',
+    'model': 'BotLPXCKK6G14'  # Your plant analysis bot
 }
 
-# Health thresholds with detailed ranges
+# Health thresholds
 HEALTH_THRESHOLDS = {
     'soil_moisture': {'min': 40, 'max': 70, 'unit': '%', 'description': 'Soil water content percentage'},
     'ph_level': {'min': 6.0, 'max': 7.5, 'unit': 'pH', 'description': 'Soil acidity/alkalinity level'},
@@ -35,433 +41,563 @@ HEALTH_THRESHOLDS = {
     'potassium': {'min': 30, 'max': 60, 'unit': 'ppm', 'description': 'Potassium content in soil'},
     'temperature': {'min': 18, 'max': 26, 'unit': '°C', 'description': 'Ambient temperature'},
     'humidity': {'min': 50, 'max': 80, 'unit': '%', 'description': 'Relative humidity level'},
-    'light_intensity': {'min': 200, 'max': 800, 'unit': 'µmol/m²/s', 'description': 'Light intensity for photosynthesis'}
+    'light_intensity': {'min': 200, 'max': 800, 'unit': 'μmol/m²/s', 'description': 'Light intensity for photosynthesis'}
 }
 
-class MetricIndicator(QWidget):
-    """Custom widget to display a metric with visual indicator"""
+class CameraThread(QThread):
+    """Thread to handle automatic camera capture"""
+    image_captured = pyqtSignal(str)  # Signal emits the path of captured image
+    capture_status = pyqtSignal(str)  # Signal for status updates
+    
+    def __init__(self, capture_interval=CAPTURE_INTERVAL):
+        super().__init__()
+        self.capture_interval = capture_interval
+        self.running = True
+        self.captures_folder = "captures"
+        self.create_captures_folder()
+        
+    def create_captures_folder(self):
+        """Create the captures folder if it doesn't exist"""
+        if not os.path.exists(self.captures_folder):
+            os.makedirs(self.captures_folder)
+            
+    def set_capture_interval(self, interval):
+        """Update capture interval"""
+        self.capture_interval = interval
+        
+    def capture_image(self):
+        """Capture a single image from the webcam"""
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            self.capture_status.emit("❌ Error: Could not open webcam")
+            return None
+        
+        # Set camera properties for better quality
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        ret, frame = cap.read()
+        
+        if ret:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"plant_{timestamp}.jpg"
+            filepath = os.path.join(self.captures_folder, filename)
+            
+            cv2.imwrite(filepath, frame)
+            cap.release()
+            
+            self.capture_status.emit(f"📸 Captured: {filename}")
+            return filepath
+        else:
+            cap.release()
+            self.capture_status.emit("❌ Error: Failed to capture image")
+            return None
+            
+    def run(self):
+        """Main thread loop"""
+        while self.running:
+            filepath = self.capture_image()
+            if filepath:
+                self.image_captured.emit(filepath)
+            
+            # Wait for the specified interval
+            for _ in range(self.capture_interval):
+                if not self.running:
+                    break
+                time.sleep(1)
+                
+    def stop(self):
+        """Stop the camera thread"""
+        self.running = False
+        self.wait()
+
+class ModernMetricCard(QWidget):
+    """Modern metric display card"""
     def __init__(self, name, value, threshold, parent=None):
         super().__init__(parent)
         self.name = name
         self.value = value
         self.threshold = threshold
         
-        self.layout = QVBoxLayout()
-        self.setLayout(self.layout)
+        self.setFixedHeight(120)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(8)
         
         # Metric name
-        self.name_label = QLabel(f"{name.replace('_', ' ').title()}: {value} {threshold['unit']}")
-        self.name_label.setFont(QFont("Arial", 10, QFont.Bold))
-        self.layout.addWidget(self.name_label)
+        name_label = QLabel(self.name.replace('_', ' ').title())
+        name_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        name_label.setStyleSheet("color: #2c3e50;")
+        layout.addWidget(name_label)
         
-        # Progress bar showing value relative to threshold
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximum(100)
+        # Value
+        value_label = QLabel(f"{self.value} {self.threshold['unit']}")
+        value_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        layout.addWidget(value_label)
         
-        # Calculate percentage for display (clamped to 0-100)
-        min_val = threshold['min']
-        max_val = threshold['max']
-        range_val = max_val - min_val
+        # Range indicator
+        range_label = QLabel(f"Normal: {self.threshold['min']}-{self.threshold['max']} {self.threshold['unit']}")
+        range_label.setFont(QFont("Segoe UI", 9))
+        range_label.setStyleSheet("color: #7f8c8d;")
+        layout.addWidget(range_label)
         
-        if range_val > 0:
-            percentage = ((value - min_val) / range_val) * 100
-            percentage = max(0, min(100, percentage))  # Clamp between 0-100
+        # Status indicator
+        status_widget = QWidget()
+        status_widget.setFixedHeight(6)
+        
+        # Determine status color
+        if self.value < self.threshold['min'] * 0.8 or self.value > self.threshold['max'] * 1.2:
+            color = "#e74c3c"  # Red - Critical
+            value_label.setStyleSheet("color: #e74c3c;")
+        elif self.value >= self.threshold['min'] and self.value <= self.threshold['max']:
+            color = "#27ae60"  # Green - Normal
+            value_label.setStyleSheet("color: #27ae60;")
         else:
-            percentage = 50  # Default if min == max
+            color = "#f39c12"  # Orange - Warning
+            value_label.setStyleSheet("color: #f39c12;")
             
-        self.progress_bar.setValue(int(percentage))
+        status_widget.setStyleSheet(f"background-color: {color}; border-radius: 3px;")
+        layout.addWidget(status_widget)
         
-        # Set color based on value relative to threshold
-        if value < min_val * 0.8 or value > max_val * 1.2:
-            # Critical - red
-            self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #e74c3c; }")
-            self.status = "critical"
-        elif value >= min_val and value <= max_val:
-            # Normal - green
-            self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #2ecc71; }")
-            self.status = "normal"
-        else:
-            # Warning - yellow
-            self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #f39c12; }")
-            self.status = "warning"
-            
-        self.layout.addWidget(self.progress_bar)
-        
-        # Threshold range label
-        range_label = QLabel(f"Normal range: {min_val} - {max_val} {threshold['unit']}")
-        range_label.setFont(QFont("Arial", 8))
-        self.layout.addWidget(range_label)
-
-class AnalysisReport(QWidget):
-    """Widget to display the detailed analysis report"""
-    def __init__(self, analysis_data, parent=None):
-        super().__init__(parent)
-        self.analysis_data = analysis_data
-        
-        layout = QVBoxLayout()
         self.setLayout(layout)
-        
-        # Report title
-        title = QLabel("Plant Health Analysis Report")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
-        
-        # Timestamp
-        timestamp = QLabel(f"Analysis performed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        timestamp.setFont(QFont("Arial", 10))
-        timestamp.setAlignment(Qt.AlignCenter)
-        layout.addWidget(timestamp)
-        
-        # Health score
-        health_score = self.analysis_data.get('health_score', 0)
-        score_label = QLabel(f"Overall Health Score: {health_score}/100")
-        score_label.setFont(QFont("Arial", 12, QFont.Bold))
-        
-        # Color code based on health score
-        if health_score >= 70:
-            score_label.setStyleSheet("color: #2ecc71;")  # Green
-        elif health_score >= 50:
-            score_label.setStyleSheet("color: #f39c12;")  # Yellow
-        else:
-            score_label.setStyleSheet("color: #e74c3c;")  # Red
-            
-        layout.addWidget(score_label)
-        
-        # Metrics grid
-        metrics_group = QGroupBox("Sensor Metrics Analysis")
-        metrics_layout = QGridLayout()
-        metrics_group.setLayout(metrics_layout)
-        
-        sensor_data = self.analysis_data.get('sensor_data', {})
-        row, col = 0, 0
-        for metric, value in sensor_data.items():
-            if metric in HEALTH_THRESHOLDS:
-                metric_widget = MetricIndicator(metric, value, HEALTH_THRESHOLDS[metric])
-                metrics_layout.addWidget(metric_widget, row, col)
-                col += 1
-                if col > 1:  # 2 columns
-                    col = 0
-                    row += 1
-                    
-        layout.addWidget(metrics_group)
-        
-        # Visual analysis summary
-        visual_group = QGroupBox("Visual Analysis")
-        visual_layout = QVBoxLayout()
-        visual_group.setLayout(visual_layout)
-        
-        visual_analysis = self.analysis_data.get('plant_analysis', {}).get('analysis', 'No visual analysis available.')
-        analysis_text = QTextEdit()
-        analysis_text.setPlainText(visual_analysis)
-        analysis_text.setReadOnly(True)
-        visual_layout.addWidget(analysis_text)
-        
-        layout.addWidget(visual_group)
-        
-        # Recommendations
-        recommendations = self.analysis_data.get('plant_analysis', {}).get('recommendations', [])
-        if recommendations:
-            rec_group = QGroupBox("Recommendations")
-            rec_layout = QVBoxLayout()
-            rec_group.setLayout(rec_layout)
-            
-            for rec in recommendations:
-                rec_label = QLabel(f"• {rec}")
-                rec_label.setWordWrap(True)
-                rec_layout.addWidget(rec_label)
-                
-            layout.addWidget(rec_group)
-            
-        # Issues detected
-        issues = self.analysis_data.get('plant_analysis', {}).get('issues_detected', [])
-        if issues:
-            issues_group = QGroupBox("Issues Detected")
-            issues_layout = QVBoxLayout()
-            issues_group.setLayout(issues_layout)
-            issues_group.setStyleSheet("QGroupBox { color: #e74c3c; font-weight: bold; }")
-            
-            for issue in issues:
-                issue_label = QLabel(f"⚠️ {issue}")
-                issue_label.setWordWrap(True)
-                issue_label.setStyleSheet("color: #e74c3c;")
-                issues_layout.addWidget(issue_label)
-                
-            layout.addWidget(issues_group)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border-radius: 12px;
+                border: 1px solid #e1e5e9;
+            }
+            QWidget:hover {
+                border: 1px solid #3498db;
+                box-shadow: 0 4px 12px rgba(52, 152, 219, 0.15);
+            }
+        """)
 
-class ImagePreview(QLabel):
-    """Widget to display the plant image with drag and drop support"""
+class ModernImageDisplay(QLabel):
+    """Modern image display widget"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
-        self.setText("Drag & drop plant image here\nor click to browse")
-        self.setStyleSheet("border: 2px dashed #ccc; padding: 20px;")
-        self.setMinimumSize(400, 300)
+        self.setText("📷 Waiting for first capture...")
+        self.setMinimumSize(300, 200)
+        self.setStyleSheet("""
+            QLabel {
+                background-color: #f8f9fa;
+                border: 2px dashed #dee2e6;
+                border-radius: 12px;
+                color: #6c757d;
+                font-size: 14px;
+                font-weight: 500;
+            }
+        """)
         
     def set_image(self, image_path):
-        pixmap = QPixmap(image_path)
-        if not pixmap.isNull():
-            # Scale the image to fit while maintaining aspect ratio
-            scaled_pixmap = pixmap.scaled(self.width(), self.height(), 
-                                         Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.setPixmap(scaled_pixmap)
-            self.image_path = image_path
-        else:
-            self.setText("Failed to load image")
+        """Set and display the image"""
+        try:
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                scaled_pixmap = pixmap.scaled(
+                    self.width() - 20, self.height() - 20, 
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                self.setPixmap(scaled_pixmap)
+                self.setStyleSheet("""
+                    QLabel {
+                        background-color: white;
+                        border: 1px solid #e1e5e9;
+                        border-radius: 12px;
+                    }
+                """)
+            else:
+                self.setText("❌ Failed to load image")
+        except Exception as e:
+            self.setText(f"❌ Error loading image: {str(e)}")
 
-class Dashboard(QMainWindow):
-    """Main dashboard window"""
+class ModernDashboard(QMainWindow):
+    """Modern Plant Health Dashboard"""
+    
     def __init__(self):
         super().__init__()
         self.analysis_history = []
         self.current_analysis = None
-        self.captures_folder = os.path.join(os.path.expanduser("~"), "captures")
+        self.camera_thread = None
+        
+        # Initialize OpenAI client for Poe API
+        self.poe_client = openai.OpenAI(
+            api_key=POE_API_CONFIG['api_key'],
+            base_url=POE_API_CONFIG['base_url'],
+        )
         
         self.init_ui()
-        self.load_settings()
+        self.apply_modern_theme()
+        self.start_camera_capture()
         
     def init_ui(self):
-        """Initialize the user interface"""
-        self.setWindowTitle("Plant Health Dashboard")
-        self.setGeometry(100, 100, 1400, 800)
+        """Initialize the modern UI"""
+        self.setWindowTitle("🌱 Plant Health Dashboard")
+        self.setGeometry(100, 100, 1600, 900)
         
-        # Central widget and main layout
+        # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        
+        # Main layout
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(20, 20, 20, 20)
         
-        # Left panel for image upload and controls
-        left_panel = QWidget()
+        # Left panel - Camera and Controls
+        left_panel = self.create_left_panel()
         left_panel.setMaximumWidth(400)
-        left_layout = QVBoxLayout(left_panel)
         
-        # Image preview with drag and drop
-        self.image_preview = ImagePreview()
-        self.image_preview.mousePressEvent = self.browse_image
-        left_layout.addWidget(self.image_preview)
+        # Right panel - Analysis Results
+        right_panel = self.create_right_panel()
         
-        # Controls section
-        controls_group = QGroupBox("Controls")
+        # Add to main layout
+        main_layout.addWidget(left_panel)
+        main_layout.addWidget(right_panel, stretch=2)
+        
+        # Status bar
+        self.statusBar().showMessage("🚀 Dashboard initialized - Starting camera...")
+        
+    def create_left_panel(self):
+        """Create the left control panel"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(20)
+        
+        # Camera preview
+        camera_group = QGroupBox("📷 Live Plant Monitor")
+        camera_layout = QVBoxLayout(camera_group)
+        
+        self.image_display = ModernImageDisplay()
+        camera_layout.addWidget(self.image_display)
+        
+        layout.addWidget(camera_group)
+        
+        # Camera controls
+        controls_group = QGroupBox("⚙️ Camera Settings")
         controls_layout = QVBoxLayout(controls_group)
         
-        # Captures folder selection
-        folder_layout = QHBoxLayout()
-        folder_label = QLabel("Captures Folder:")
-        self.folder_path = QLineEdit(self.captures_folder)
-        browse_folder_btn = QPushButton("Browse")
-        browse_folder_btn.clicked.connect(self.select_captures_folder)
+        # Capture interval setting
+        interval_layout = QHBoxLayout()
+        interval_label = QLabel("Capture Interval (seconds):")
+        self.interval_spinbox = QSpinBox()
+        self.interval_spinbox.setRange(5, 3600)  # 5 seconds to 1 hour
+        self.interval_spinbox.setValue(CAPTURE_INTERVAL)
+        self.interval_spinbox.valueChanged.connect(self.update_capture_interval)
         
-        folder_layout.addWidget(folder_label)
-        folder_layout.addWidget(self.folder_path)
-        folder_layout.addWidget(browse_folder_btn)
-        controls_layout.addLayout(folder_layout)
+        interval_layout.addWidget(interval_label)
+        interval_layout.addWidget(self.interval_spinbox)
+        controls_layout.addLayout(interval_layout)
         
-        # Load latest capture button
-        self.load_latest_btn = QPushButton("Load Latest Capture")
-        self.load_latest_btn.clicked.connect(self.load_latest_capture)
-        controls_layout.addWidget(self.load_latest_btn)
+        # Auto-analysis toggle
+        self.auto_analyze_checkbox = QCheckBox("Auto-analyze new captures")
+        self.auto_analyze_checkbox.setChecked(True)
+        controls_layout.addWidget(self.auto_analyze_checkbox)
         
-        # Analyze button
-        self.analyze_btn = QPushButton("Analyze Plant Health")
-        self.analyze_btn.clicked.connect(self.analyze_plant)
+        # Manual analyze button
+        self.analyze_btn = QPushButton("🔍 Analyze Current Image")
+        self.analyze_btn.clicked.connect(self.analyze_current_image)
         self.analyze_btn.setEnabled(False)
         controls_layout.addWidget(self.analyze_btn)
         
-        left_layout.addWidget(controls_group)
+        layout.addWidget(controls_group)
         
-        # History section
-        history_group = QGroupBox("Recent Analyses")
+        # Analysis history
+        history_group = QGroupBox("📊 Analysis History")
         history_layout = QVBoxLayout(history_group)
         
-        self.history_list = QTableWidget()
-        self.history_list.setColumnCount(3)
-        self.history_list.setHorizontalHeaderLabels(["Date", "Health Score", "Status"])
-        self.history_list.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.history_list.setSelectionBehavior(QTableWidget.SelectRows)
-        self.history_list.doubleClicked.connect(self.view_history_item)
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(3)
+        self.history_table.setHorizontalHeaderLabels(["Time", "Score", "Status"])
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.history_table.setMaximumHeight(200)
+        self.history_table.doubleClicked.connect(self.view_history_item)
         
-        history_layout.addWidget(self.history_list)
-        left_layout.addWidget(history_group)
+        history_layout.addWidget(self.history_table)
+        layout.addWidget(history_group)
         
-        # Right panel for analysis results
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
+        layout.addStretch()
+        return panel
         
-        # Tab widget for different views
-        self.tabs = QTabWidget()
+    def create_right_panel(self):
+        """Create the right analysis panel"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
         
-        # Dashboard tab
-        self.dashboard_tab = QWidget()
-        self.setup_dashboard_tab()
-        self.tabs.addTab(self.dashboard_tab, "Dashboard")
+        # Header
+        header = QLabel("🌿 Plant Health Analysis")
+        header.setFont(QFont("Segoe UI", 20, QFont.Bold))
+        header.setStyleSheet("color: #2c3e50; margin-bottom: 10px;")
+        layout.addWidget(header)
         
-        # Detailed report tab
-        self.report_tab = QWidget()
-        self.report_layout = QVBoxLayout(self.report_tab)
-        self.report_scroll = QScrollArea()
-        self.report_scroll.setWidgetResizable(True)
-        self.report_layout.addWidget(self.report_scroll)
-        self.tabs.addTab(self.report_tab, "Detailed Report")
+        # Health score display
+        self.health_score_widget = self.create_health_score_widget()
+        layout.addWidget(self.health_score_widget)
         
-        right_layout.addWidget(self.tabs)
+        # Metrics grid
+        self.metrics_container = QWidget()
+        self.metrics_layout = QGridLayout(self.metrics_container)
+        self.metrics_layout.setSpacing(15)
+        layout.addWidget(self.metrics_container)
         
-        # Add panels to main layout
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([300, 1100])
+        # Analysis report
+        report_group = QGroupBox("📋 Detailed Analysis")
+        report_layout = QVBoxLayout(report_group)
         
-        main_layout.addWidget(splitter)
+        self.analysis_text = QTextEdit()
+        self.analysis_text.setReadOnly(True)
+        self.analysis_text.setMaximumHeight(150)
+        self.analysis_text.setPlainText("Waiting for first analysis...")
+        report_layout.addWidget(self.analysis_text)
         
-        # Status bar
-        self.statusBar().showMessage("Ready")
+        layout.addWidget(report_group)
         
-    def setup_dashboard_tab(self):
-        """Set up the dashboard tab with overview widgets"""
-        layout = QVBoxLayout(self.dashboard_tab)
+        # Recommendations
+        rec_group = QGroupBox("💡 Recommendations")
+        rec_layout = QVBoxLayout(rec_group)
         
-        # Health score indicator
-        health_group = QGroupBox("Overall Health")
-        health_layout = QVBoxLayout(health_group)
+        self.recommendations_text = QTextEdit()
+        self.recommendations_text.setReadOnly(True)
+        self.recommendations_text.setMaximumHeight(120)
+        self.recommendations_text.setPlainText("Analysis recommendations will appear here...")
+        rec_layout.addWidget(self.recommendations_text)
         
-        self.health_score = QLabel("No analysis yet")
-        self.health_score.setFont(QFont("Arial", 24, QFont.Bold))
-        self.health_score.setAlignment(Qt.AlignCenter)
-        health_layout.addWidget(self.health_score)
+        layout.addWidget(rec_group)
         
-        self.health_status = QLabel("Upload an image to begin analysis")
-        self.health_status.setAlignment(Qt.AlignCenter)
-        health_layout.addWidget(self.health_status)
+        return panel
         
-        layout.addWidget(health_group)
+    def create_health_score_widget(self):
+        """Create the health score display widget"""
+        widget = QWidget()
+        widget.setFixedHeight(100)
+        layout = QHBoxLayout(widget)
         
-        # Key metrics
-        metrics_group = QGroupBox("Key Metrics")
-        metrics_layout = QGridLayout(metrics_group)
+        # Score circle (simplified as text for now)
+        score_container = QWidget()
+        score_container.setFixedSize(80, 80)
+        score_layout = QVBoxLayout(score_container)
+        score_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Placeholder metrics - will be updated after analysis
-        self.metric_widgets = {}
-        important_metrics = ['soil_moisture', 'ph_level', 'temperature', 'humidity']
+        self.health_score_label = QLabel("--")
+        self.health_score_label.setFont(QFont("Segoe UI", 24, QFont.Bold))
+        self.health_score_label.setAlignment(Qt.AlignCenter)
+        self.health_score_label.setStyleSheet("color: #7f8c8d;")
+        score_layout.addWidget(self.health_score_label)
         
-        for i, metric in enumerate(important_metrics):
-            widget = QLabel("N/A")
-            widget.setAlignment(Qt.AlignCenter)
-            widget.setFrameStyle(QFrame.Box)
-            metrics_layout.addWidget(QLabel(metric.replace('_', ' ').title()), i, 0)
-            metrics_layout.addWidget(widget, i, 1)
-            self.metric_widgets[metric] = widget
+        score_text = QLabel("Health Score")
+        score_text.setFont(QFont("Segoe UI", 10))
+        score_text.setAlignment(Qt.AlignCenter)
+        score_text.setStyleSheet("color: #7f8c8d;")
+        score_layout.addWidget(score_text)
+        
+        # Status text
+        self.status_label = QLabel("Waiting for analysis...")
+        self.status_label.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.status_label.setStyleSheet("color: #7f8c8d;")
+        
+        layout.addWidget(score_container)
+        layout.addWidget(self.status_label)
+        layout.addStretch()
+        
+        widget.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border-radius: 12px;
+                border: 1px solid #e1e5e9;
+                margin-bottom: 20px;
+            }
+        """)
+        
+        return widget
+        
+    def apply_modern_theme(self):
+        """Apply modern theme to the application"""
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f8f9fa;
+            }
+            QGroupBox {
+                font-weight: bold;
+                font-size: 12px;
+                color: #2c3e50;
+                border: 1px solid #e1e5e9;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+                background-color: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 8px 0 8px;
+                background-color: white;
+            }
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 12px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+            QPushButton:pressed {
+                background-color: #21618c;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+            QTextEdit {
+                border: 1px solid #e1e5e9;
+                border-radius: 8px;
+                background-color: #f8f9fa;
+                padding: 10px;
+            }
+            QSpinBox {
+                border: 1px solid #e1e5e9;
+                border-radius: 6px;
+                padding: 8px;
+                background-color: white;
+            }
+            QCheckBox {
+                font-weight: 500;
+                color: #2c3e50;
+            }
+            QTableWidget {
+                border: 1px solid #e1e5e9;
+                border-radius: 8px;
+                background-color: white;
+                gridline-color: #f1f3f4;
+            }
+            QHeaderView::section {
+                background-color: #f8f9fa;
+                padding: 8px;
+                border: 1px solid #e1e5e9;
+                font-weight: bold;
+            }
+        """)
+        
+    def start_camera_capture(self):
+        """Start the automatic camera capture"""
+        self.camera_thread = CameraThread(CAPTURE_INTERVAL)
+        self.camera_thread.image_captured.connect(self.on_image_captured)
+        self.camera_thread.capture_status.connect(self.on_capture_status)
+        self.camera_thread.start()
+        
+    @pyqtSlot(str)
+    def on_image_captured(self, image_path):
+        """Handle new image capture"""
+        self.image_display.set_image(image_path)
+        self.current_image_path = image_path
+        self.analyze_btn.setEnabled(True)
+        
+        # Auto-analyze if enabled
+        if self.auto_analyze_checkbox.isChecked():
+            self.analyze_current_image()
             
-        layout.addWidget(metrics_group)
+    @pyqtSlot(str)  
+    def on_capture_status(self, status):
+        """Handle capture status updates"""
+        self.statusBar().showMessage(status)
         
-        # Alerts section
-        alerts_group = QGroupBox("Alerts & Notifications")
-        alerts_layout = QVBoxLayout(alerts_group)
-        
-        self.alerts_display = QTextEdit()
-        self.alerts_display.setReadOnly(True)
-        self.alerts_display.setPlainText("No alerts. Plant health appears normal.")
-        alerts_layout.addWidget(self.alerts_display)
-        
-        layout.addWidget(alerts_group)
-        
-        # Action buttons
-        button_layout = QHBoxLayout()
-        
-        self.pdf_btn = QPushButton("Generate PDF Report")
-        self.pdf_btn.clicked.connect(self.generate_pdf_report)
-        self.pdf_btn.setEnabled(False)
-        button_layout.addWidget(self.pdf_btn)
-        
-        self.email_btn = QPushButton("Email Report")
-        self.email_btn.clicked.connect(self.email_report)
-        self.email_btn.setEnabled(False)
-        button_layout.addWidget(self.email_btn)
-        
-        layout.addLayout(button_layout)
-        
-    def browse_image(self, event):
-        """Open file dialog to select an image"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Plant Image", "", 
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.tiff)"
-        )
-        
-        if file_path:
-            self.image_preview.set_image(file_path)
-            self.analyze_btn.setEnabled(True)
+    def update_capture_interval(self, interval):
+        """Update the camera capture interval"""
+        if self.camera_thread:
+            self.camera_thread.set_capture_interval(interval)
+            self.statusBar().showMessage(f"📷 Capture interval updated to {interval} seconds")
             
-    def select_captures_folder(self):
-        """Select the folder where plant images are captured"""
-        folder = QFileDialog.getExistingDirectory(self, "Select Captures Folder", self.captures_folder)
-        if folder:
-            self.captures_folder = folder
-            self.folder_path.setText(folder)
-            
-    def load_latest_capture(self):
-        """Load the most recent image from the captures folder"""
-        try:
-            captures_path = Path(self.captures_folder)
-            if not captures_path.exists():
-                QMessageBox.warning(self, "Folder Not Found", 
-                                  f"The captures folder does not exist: {self.captures_folder}")
-                return
-                
-            # Find all image files
-            image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tiff']
-            image_files = []
-            for ext in image_extensions:
-                image_files.extend(captures_path.glob(ext))
-                
-            if not image_files:
-                QMessageBox.information(self, "No Images", 
-                                      "No plant images found in the captures folder.")
-                return
-                
-            # Get the most recent file
-            latest_file = max(image_files, key=os.path.getctime)
-            self.image_preview.set_image(str(latest_file))
-            self.analyze_btn.setEnabled(True)
-            self.statusBar().showMessage(f"Loaded latest capture: {latest_file.name}")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load latest capture: {str(e)}")
-            
-    def analyze_plant(self):
-        """Send the image to AI bots for analysis"""
-        if not hasattr(self.image_preview, 'image_path'):
-            QMessageBox.warning(self, "No Image", "Please select an image first.")
+    def analyze_current_image(self):
+        """Analyze the current image using Poe API"""
+        if not hasattr(self, 'current_image_path'):
+            QMessageBox.warning(self, "No Image", "No image available for analysis.")
             return
             
-        self.statusBar().showMessage("Analyzing plant health...")
+        self.statusBar().showMessage("🔍 Analyzing plant health...")
         self.analyze_btn.setEnabled(False)
         
-        # Simulate API calls (replace with actual Poe API integration)
-        # In a real implementation, you would make actual HTTP requests to the Poe API
-        
-        # For demonstration, we'll use mock data
-        plant_analysis = {
-            "analysis": "Plant exhibits healthy green foliage with good leaf structure. "
-                       "Minor yellowing observed on lower leaves, possibly indicating "
-                       "natural aging or slight nutrient deficiency.",
-            "health_score": 82,
-            "confidence": 0.89,
-            "recommendations": [
-                "Monitor nitrogen levels - slight deficiency indicated by lower leaf yellowing",
-                "Maintain current watering schedule",
-                "Consider light fertilization with balanced NPK",
-                "Continue regular monitoring for pest activity"
-            ],
-            "issues_detected": [
-                "Mild nitrogen deficiency (lower leaf yellowing)",
-                "Slight leaf tip browning - possible over-fertilization"
-            ],
-            "disease_risk": "Low",
-            "growth_stage": "Mature vegetative"
-        }
-        
-        # Mock sensor data
+        try:
+            # Convert image to base64 for API
+            with open(self.current_image_path, 'rb') as img_file:
+                img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+            
+            # Call Poe API
+            response = self.poe_client.chat.completions.create(
+                model=POE_API_CONFIG['model'],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Analyze this plant image for health assessment. Provide: 1) Overall health score (0-100), 2) Detailed analysis of visible conditions, 3) Specific recommendations for improvement, 4) Any diseases or issues detected. Format as JSON with keys: health_score, analysis, recommendations (array), issues_detected (array)."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{img_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            )
+            
+            # Parse response
+            analysis_text = response.choices[0].message.content
+            
+            # Try to parse JSON, fallback to text parsing
+            try:
+                import json
+                analysis_data = json.loads(analysis_text)
+            except:
+                # Fallback parsing
+                analysis_data = {
+                    "health_score": 75,  # Default score
+                    "analysis": analysis_text,
+                    "recommendations": ["Monitor plant regularly", "Ensure proper watering"],
+                    "issues_detected": []
+                }
+            
+            # Generate mock sensor data (replace with actual sensor integration)
+            sensor_data = self.generate_mock_sensor_data()
+            
+            # Create complete analysis
+            complete_analysis = {
+                "timestamp": datetime.now().isoformat(),
+                "image_path": self.current_image_path,
+                "plant_analysis": analysis_data,
+                "sensor_data": sensor_data
+            }
+            
+            self.current_analysis = complete_analysis
+            self.analysis_history.append(complete_analysis)
+            
+            # Update UI
+            self.update_dashboard()
+            self.update_history_table()
+            
+            self.statusBar().showMessage("✅ Analysis completed successfully!")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Analysis Error", f"Failed to analyze image: {str(e)}")
+            self.statusBar().showMessage("❌ Analysis failed")
+            
+        finally:
+            self.analyze_btn.setEnabled(True)
+            
+    def generate_mock_sensor_data(self):
+        """Generate mock sensor data (replace with actual sensor integration)"""
         import random
-        sensor_data = {
+        return {
             "soil_moisture": round(random.uniform(45, 65), 1),
             "ph_level": round(random.uniform(6.2, 7.2), 1),
             "nitrogen": round(random.uniform(18, 35), 1),
@@ -472,285 +608,125 @@ class Dashboard(QMainWindow):
             "light_intensity": round(random.uniform(300, 600), 0)
         }
         
-        # Combine analysis results
-        self.current_analysis = {
-            "timestamp": datetime.now().isoformat(),
-            "image_path": self.image_preview.image_path,
-            "plant_analysis": plant_analysis,
-            "sensor_data": sensor_data
-        }
-        
-        # Add to history
-        self.analysis_history.append(self.current_analysis)
-        self.update_history_list()
-        
-        # Update UI with results
-        self.update_dashboard()
-        
-        # Enable report buttons
-        self.pdf_btn.setEnabled(True)
-        self.email_btn.setEnabled(True)
-        
-        self.statusBar().showMessage("Analysis complete")
-        
     def update_dashboard(self):
-        """Update the dashboard with current analysis results"""
+        """Update dashboard with current analysis"""
         if not self.current_analysis:
             return
             
-        # Update health score
-        health_score = self.current_analysis['plant_analysis']['health_score']
-        self.health_score.setText(f"{health_score}/100")
-        
-        # Set color based on health score
-        if health_score >= 70:
-            self.health_score.setStyleSheet("color: #2ecc71;")  # Green
-            self.health_status.setText("Healthy")
-        elif health_score >= 50:
-            self.health_score.setStyleSheet("color: #f39c12;")  # Yellow
-            self.health_status.setText("Needs Attention")
-        else:
-            self.health_score.setStyleSheet("color: #e74c3c;")  # Red
-            self.health_status.setText("Critical")
-            
-        # Update key metrics
+        analysis = self.current_analysis['plant_analysis']
         sensor_data = self.current_analysis['sensor_data']
-        for metric, widget in self.metric_widgets.items():
-            if metric in sensor_data:
-                value = sensor_data[metric]
-                unit = HEALTH_THRESHOLDS[metric]['unit']
-                widget.setText(f"{value} {unit}")
-                
-                # Color code based on thresholds
-                threshold = HEALTH_THRESHOLDS[metric]
-                if value < threshold['min'] * 0.8 or value > threshold['max'] * 1.2:
-                    widget.setStyleSheet("background-color: #e74c3c; color: white;")  # Red
-                elif value >= threshold['min'] and value <= threshold['max']:
-                    widget.setStyleSheet("background-color: #2ecc71; color: white;")  # Green
-                else:
-                    widget.setStyleSheet("background-color: #f39c12; color: white;")  # Yellow
-                    
-        # Update alerts
-        alerts = []
-        plant_analysis = self.current_analysis['plant_analysis']
         
-        # Check sensor data for anomalies
+        # Update health score
+        health_score = analysis.get('health_score', 0)
+        self.health_score_label.setText(str(health_score))
+        
+        # Update status and colors
+        if health_score >= 80:
+            self.health_score_label.setStyleSheet("color: #27ae60;")
+            self.status_label.setText("Excellent Health")
+            self.status_label.setStyleSheet("color: #27ae60;")
+        elif health_score >= 60:
+            self.health_score_label.setStyleSheet("color: #f39c12;")
+            self.status_label.setText("Good Health")
+            self.status_label.setStyleSheet("color: #f39c12;")
+        else:
+            self.health_score_label.setStyleSheet("color: #e74c3c;")
+            self.status_label.setText("Needs Attention")
+            self.status_label.setStyleSheet("color: #e74c3c;")
+            
+        # Update metrics grid
+        self.clear_metrics()
+        row, col = 0, 0
         for metric, value in sensor_data.items():
             if metric in HEALTH_THRESHOLDS:
-                threshold = HEALTH_THRESHOLDS[metric]
-                if value < threshold['min']:
-                    alerts.append(f"⚠️ {metric.replace('_', ' ').title()} is low: {value} {threshold['unit']} "
-                                f"(normal: {threshold['min']}-{threshold['max']} {threshold['unit']})")
-                elif value > threshold['max']:
-                    alerts.append(f"⚠️ {metric.replace('_', ' ').title()} is high: {value} {threshold['unit']} "
-                                f"(normal: {threshold['min']}-{threshold['max']} {threshold['unit']})")
+                metric_card = ModernMetricCard(metric, value, HEALTH_THRESHOLDS[metric])
+                self.metrics_layout.addWidget(metric_card, row, col)
+                col += 1
+                if col > 2:  # 3 columns
+                    col = 0
+                    row += 1
+                    
+        # Update analysis text
+        self.analysis_text.setPlainText(analysis.get('analysis', 'No analysis available'))
         
-        # Add issues from visual analysis
-        for issue in plant_analysis.get('issues_detected', []):
-            alerts.append(f"🔍 {issue}")
-            
-        # Add recommendations
-        for rec in plant_analysis.get('recommendations', []):
-            alerts.append(f"💡 {rec}")
-            
-        if alerts:
-            self.alerts_display.setPlainText("\n\n".join(alerts))
+        # Update recommendations
+        recommendations = analysis.get('recommendations', [])
+        if recommendations:
+            rec_text = "\n".join([f"• {rec}" for rec in recommendations])
         else:
-            self.alerts_display.setPlainText("No alerts. Plant health appears normal.")
-            
-        # Update detailed report
-        self.update_report()
+            rec_text = "No specific recommendations at this time."
+        self.recommendations_text.setPlainText(rec_text)
         
-    def update_report(self):
-        """Update the detailed report tab"""
-        if not self.current_analysis:
-            return
-            
-        # Clear previous report
-        if hasattr(self, 'report_widget'):
-            self.report_scroll.takeWidget()
-            
-        # Create new report
-        self.report_widget = AnalysisReport(self.current_analysis)
-        self.report_scroll.setWidget(self.report_widget)
-        
-    def update_history_list(self):
-        """Update the history list with all analyses"""
-        self.history_list.setRowCount(len(self.analysis_history))
-        
-        for i, analysis in enumerate(reversed(self.analysis_history)):
-            timestamp = datetime.fromisoformat(analysis['timestamp']).strftime("%Y-%m-%d %H:%M")
-            health_score = analysis['plant_analysis']['health_score']
-            
-            # Create table items
-            self.history_list.setItem(i, 0, QTableWidgetItem(timestamp))
-            self.history_list.setItem(i, 1, QTableWidgetItem(str(health_score)))
-            
-            # Status item with color coding
-            status_item = QTableWidgetItem()
-            if health_score >= 70:
-                status_item.setText("Healthy")
-                status_item.setBackground(QColor(46, 204, 113))  # Green
-            elif health_score >= 50:
-                status_item.setText("Needs Attention")
-                status_item.setBackground(QColor(243, 156, 18))  # Yellow
-            else:
-                status_item.setText("Critical")
-                status_item.setBackground(QColor(231, 76, 60))   # Red
+    def clear_metrics(self):
+        """Clear existing metric widgets"""
+        while self.metrics_layout.count():
+            child = self.metrics_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
                 
-            status_item.setForeground(QColor(255, 255, 255))  # White text
-            self.history_list.setItem(i, 2, status_item)
+    def update_history_table(self):
+        """Update the history table"""
+        self.history_table.setRowCount(min(len(self.analysis_history), 10))  # Show last 10
+        
+        for i, analysis in enumerate(reversed(self.analysis_history[-10:])):
+            timestamp = datetime.fromisoformat(analysis['timestamp']).strftime("%H:%M:%S")
+            health_score = analysis['plant_analysis'].get('health_score', 0)
+            
+            self.history_table.setItem(i, 0, QTableWidgetItem(timestamp))
+            self.history_table.setItem(i, 1, QTableWidgetItem(str(health_score)))
+            
+            # Status with color
+            status_item = QTableWidgetItem()
+            if health_score >= 80:
+                status_item.setText("Excellent")
+                status_item.setForeground(QColor(39, 174, 96))
+            elif health_score >= 60:
+                status_item.setText("Good")  
+                status_item.setForeground(QColor(243, 156, 18))
+            else:
+                status_item.setText("Poor")
+                status_item.setForeground(QColor(231, 76, 60))
+                
+            self.history_table.setItem(i, 2, status_item)
             
     def view_history_item(self, index):
-        """View a historical analysis item"""
-        # Reverse index since we display history in reverse chronological order
-        idx = len(self.analysis_history) - index.row() - 1
-        if 0 <= idx < len(self.analysis_history):
-            self.current_analysis = self.analysis_history[idx]
+        """View a historical analysis"""
+        row = index.row()
+        if row < len(self.analysis_history):
+            # Get the analysis (accounting for reversed display)
+            analysis_index = len(self.analysis_history) - 1 - row
+            self.current_analysis = self.analysis_history[analysis_index]
+            
+            # Update image display
+            if os.path.exists(self.current_analysis['image_path']):
+                self.image_display.set_image(self.current_analysis['image_path'])
+            
+            # Update dashboard
             self.update_dashboard()
-            self.tabs.setCurrentIndex(1)  # Switch to report tab
             
-    def generate_pdf_report(self):
-        """Generate a PDF report of the current analysis"""
-        if not self.current_analysis:
-            QMessageBox.warning(self, "No Analysis", "No analysis data available to generate report.")
-            return
-            
-        # In a real implementation, you would use a library like ReportLab
-        # to generate a professional PDF report
-        
-        # For demonstration, we'll just show a message
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save PDF Report", "", "PDF Files (*.pdf)"
-        )
-        
-        if save_path:
-            # Here you would implement actual PDF generation
-            # For now, we'll just create a simple text file as a placeholder
-            try:
-                with open(save_path, 'w') as f:
-                    f.write("Plant Health Analysis Report\n")
-                    f.write("============================\n\n")
-                    f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    f.write(f"Health Score: {self.current_analysis['plant_analysis']['health_score']}/100\n\n")
-                    
-                    f.write("Sensor Data:\n")
-                    for metric, value in self.current_analysis['sensor_data'].items():
-                        f.write(f"  {metric.replace('_', ' ').title()}: {value} {HEALTH_THRESHOLDS[metric]['unit']}\n")
-                    
-                    f.write("\nVisual Analysis:\n")
-                    f.write(f"  {self.current_analysis['plant_analysis']['analysis']}\n")
-                    
-                    f.write("\nRecommendations:\n")
-                    for rec in self.current_analysis['plant_analysis']['recommendations']:
-                        f.write(f"  • {rec}\n")
-                        
-                QMessageBox.information(self, "Report Generated", 
-                                      f"Report saved to: {save_path}\n\nNote: This is a placeholder implementation. "
-                                      "In production, you would use a proper PDF generation library.")
-                
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to generate report: {str(e)}")
-                
-    def email_report(self):
-        """Email the current analysis report"""
-        if not self.current_analysis:
-            QMessageBox.warning(self, "No Analysis", "No analysis data available to email.")
-            return
-            
-        # In a real implementation, you would integrate with an email service
-        QMessageBox.information(self, "Email Report", 
-                              "This would send the report via email in a production environment.\n\n"
-                              "You would need to implement email integration with your preferred email service.")
-        
-    def load_settings(self):
-        """Load application settings"""
-        # In a real implementation, you would load from a config file
-        pass
-        
-    def save_settings(self):
-        """Save application settings"""
-        # In a real implementation, you would save to a config file
-        pass
-        
     def closeEvent(self, event):
-        """Handle application close event"""
-        self.save_settings()
+        """Handle application close"""
+        if self.camera_thread:
+            self.camera_thread.stop()
         event.accept()
-
-def call_poe_bot(bot_name, message, image_path=None):
-    """
-    Function to call Poe bots via API
-    Replace this with your actual Poe API implementation
-    """
-    # This is a placeholder implementation
-    # In production, you would make actual API calls to Poe
-    
-    headers = {
-        'Authorization': f'Bearer {POE_API_CONFIG["api_key"]}',
-        'Content-Type': 'application/json'
-    }
-    
-    payload = {
-        'bot': POE_API_CONFIG['bots'].get(bot_name, bot_name),
-        'message': message
-    }
-    
-    # Add image if provided (would need to encode as base64)
-    if image_path:
-        # Implementation for image handling would go here
-        pass
-        
-    try:
-        # Actual API call would look something like this:
-        # response = requests.post(POE_API_CONFIG['base_url'], headers=headers, json=payload)
-        # return response.json()
-        
-        # For now, return mock data
-        if bot_name == "plant_health_analyzer":
-            return {
-                "analysis": "Plant exhibits healthy green foliage with good leaf structure. "
-                           "Minor yellowing observed on lower leaves, possibly indicating "
-                           "natural aging or slight nutrient deficiency.",
-                "health_score": 82,
-                "confidence": 0.89,
-                "recommendations": [
-                    "Monitor nitrogen levels - slight deficiency indicated by lower leaf yellowing",
-                    "Maintain current watering schedule",
-                    "Consider light fertilization with balanced NPK",
-                    "Continue regular monitoring for pest activity"
-                ],
-                "issues_detected": [
-                    "Mild nitrogen deficiency (lower leaf yellowing)",
-                    "Slight leaf tip browning - possible over-fertilization"
-                ],
-                "disease_risk": "Low",
-                "growth_stage": "Mature vegetative"
-            }
-        elif bot_name == "sensor_data_analyzer":
-            import random
-            return {
-                "soil_moisture": round(random.uniform(45, 65), 1),
-                "ph_level": round(random.uniform(6.2, 7.2), 1),
-                "nitrogen": round(random.uniform(18, 35), 1),
-                "phosphorus": round(random.uniform(6, 14), 1),
-                "potassium": round(random.uniform(35, 55), 1),
-                "temperature": round(random.uniform(20, 24), 1),
-                "humidity": round(random.uniform(55, 75), 1),
-                "light_intensity": round(random.uniform(300, 600), 0)
-            }
-            
-    except Exception as e:
-        print(f"Error calling Poe bot {bot_name}: {str(e)}")
-        return {"error": f"API call failed: {str(e)}"}
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # Set application style
-    app.setStyle("Fusion")
+    # Set modern application properties
+    app.setApplicationName("Plant Health Dashboard")
+    app.setApplicationVersion("2.0")
+    app.setStyle("Fusion")  # Modern fusion style
     
-    dashboard = Dashboard()
+    # Apply modern palette
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(248, 249, 250))
+    palette.setColor(QPalette.WindowText, QColor(44, 62, 80))
+    palette.setColor(QPalette.Base, QColor(255, 255, 255))
+    palette.setColor(QPalette.AlternateBase, QColor(241, 243, 244))
+    app.setPalette(palette)
+    
+    dashboard = ModernDashboard()
     dashboard.show()
     
     sys.exit(app.exec_())
