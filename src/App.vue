@@ -9,10 +9,13 @@
     </div>
 
     <header class="app-header">
-      <h1>🌱 Plant Health Dashboard</h1>
+      <h1>🌱 AgroSIEM Dashboard</h1>
       <div class="header-controls">
         <button @click="captureImage" class="btn btn-primary">
           📸 Capture Image
+        </button>
+        <button @click="uploadImage" class="btn btn-secondary">
+          📁 Upload Image
         </button>
         <button @click="downloadReport" class="btn btn-secondary" :disabled="!currentAnalysis">
           📄 Download Report
@@ -114,6 +117,40 @@
     </div>
 
     <input type="file" ref="fileInput" @change="handleFileUpload" accept="image/*" capture="environment" style="display: none;" />
+    
+    <div v-if="showChatBot" class="chat-bot-container">
+      <div class="chat-header">
+        <h3>🌿 AgroSIEM Assistant</h3>
+        <div class="connection-status" :class="apiStatus"></div>
+        <button @click="showChatBot = false" class="close-chat">×</button>
+      </div>
+      <div class="chat-messages" ref="chatMessages">
+        <div v-for="(message, index) in chatMessages" :key="index" 
+            :class="['message', message.role]">
+          <div class="message-content">{{ message.content }}</div>
+          <div class="message-time">{{ formatTime(message.timestamp) }}</div>
+        </div>
+      </div>
+      <div class="chat-input">
+        <input 
+          v-model="userMessage" 
+          @keyup.enter="sendMessage" 
+          placeholder="Ask about plant care..." 
+          :disabled="isLoading"
+        />
+        <button @click="sendMessage" :disabled="isLoading || !userMessage.trim()">
+          {{ isLoading ? '⏳' : '➤' }}
+        </button>
+      </div>
+    </div>
+
+    <button @click="toggleChatBot" class="bot-toggle-btn">
+      🤖 AgroSIEM Assistant
+    </button>
+    
+    <div class="api-status" :class="apiStatus">
+      API: {{ apiStatus }}
+    </div>
   </div>
 </template>
 
@@ -130,6 +167,13 @@ export default {
       history: [],
       alerts: [],
       autoAnalyze: true,
+      showChatBot: false,
+      chatMessages: [],
+      userMessage: '',
+      isLoading: false,
+      retryCount: 0,
+      maxRetries: 2,
+      apiStatus: 'disconnected',
       HEALTH_THRESHOLDS: {
         'soil_moisture': {'min': 40, 'max': 70, 'unit': '%'},
         'ph_level': {'min': 6.0, 'max': 7.5, 'unit': 'pH'},
@@ -145,6 +189,8 @@ export default {
   mounted() {
     this.initSocket();
     this.loadHistory();
+    this.checkApiStatus();
+    setInterval(this.checkApiStatus, 30000); // Check every 30 seconds
   },
   methods: {
     initSocket() {
@@ -184,79 +230,119 @@ export default {
     },
     
     getImageUrl(path) {
-      // In a real app, you'd serve images through a proper endpoint
-      return path ? `http://localhost:5000/${path}` : null;
-    },
-    
-   async captureImage() {
-        try {
-          // Use the camera capture endpoint instead of file upload
-          const response = await fetch('/api/camera/capture', {
-            method: 'POST'
-          });
-          
-          if (!response.ok) {
-            throw new Error('Failed to capture image from camera');
-          }
-          
-          const data = await response.json();
-          this.showNotification('Image captured successfully!', 'success');
-          
-          // The backend will emit socket events for image processing
-          
-        } catch (error) {
-          this.showNotification(`Error: ${error.message}`, 'error');
-          console.error('Capture error:', error);
-          
-          // Fallback to file input if camera capture fails
-          this.$refs.fileInput.click();
+        if (!path) return null;
+        
+        // Extract just the filename from the path
+        const filename = path.split('/').pop();
+        
+        // Determine which endpoint to use based on the path
+        if (path.includes('uploads')) {
+          return `/uploads/${filename}`;
+        } else if (path.includes('captures')) {
+          return `/captures/${filename}`;
         }
+        
+        return null;
       },
-    async handleFileUpload(event) {
-       const file = event.target.files[0];
-        if (!file) return;
+    
+    async captureImage() {
+      try {
+        // Use the camera capture endpoint instead of file upload
+        const response = await fetch('/api/camera/capture', {
+          method: 'POST'
+        });
         
-        const formData = new FormData();
-        formData.append('image', file);
-        
-        try {
-          const response = await fetch('/api/capture', {
-            method: 'POST',
-            body: formData
-          });
-          
-          if (!response.ok) {
-            throw new Error('Failed to upload image');
-          }
-          
-          this.showNotification('Image uploaded successfully!', 'success');
-        } catch (error) {
-          this.showNotification(`Error: ${error.message}`, 'error');
+        if (!response.ok) {
+          throw new Error('Failed to capture image from camera');
         }
         
-        // Reset file input
-        event.target.value = '';
-        },
+        const data = await response.json();
+        this.showNotification('Image captured successfully!', 'success');
         
-        async analyzeImage(imagePath) {
+        // The backend will emit socket events for image processing
+        
+      } catch (error) {
+        this.showNotification(`Error: ${error.message}`, 'error');
+        console.error('Capture error:', error);
+        
+        // Fallback to file input if camera capture fails
+        this.$refs.fileInput.click();
+      }
+    },
+    async uploadImage() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.onchange = async (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          
+          const formData = new FormData();
+          formData.append('image', file);
+          
           try {
-            const response = await fetch('/api/analyze', {
+            const response = await fetch('/api/upload', {
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({ image_path: imagePath })
+              body: formData
             });
             
             if (!response.ok) {
-              throw new Error('Failed to start analysis');
+              throw new Error('Failed to upload image');
             }
             
-            this.showNotification('Analysis started...', 'info');
+            this.showNotification('Image uploaded successfully! Analysis started...', 'success');
           } catch (error) {
-            this.showNotification(`Error: ${error.message}`, 'error');
+            this.showNotification(`Upload error: ${error.message}`, 'error');
           }
-        },
+        };
+        input.click();
+      },
+    
+    async handleFileUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      
+      const formData = new FormData();
+      formData.append('image', file);
+      
+      try {
+        const response = await fetch('/api/capture', {
+          method: 'POST',
+          body: formData
+        });
+        
+        if (!response.ok) {
+          throw new Error('Failed to upload image');
+        }
+        
+        this.showNotification('Image uploaded successfully!', 'success');
+      } catch (error) {
+        this.showNotification(`Error: ${error.message}`, 'error');
+      }
+      
+      // Reset file input
+      event.target.value = '';
+    },
+    
+    async analyzeImage(imagePath) {
+      try {
+        const response = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ image_path: imagePath })
+        });
+        
+        if (!response.ok) {
+          throw new Error('Failed to start analysis');
+        }
+        
+        this.showNotification('Analysis started...', 'info');
+      } catch (error) {
+        this.showNotification(`Error: ${error.message}`, 'error');
+      }
+    },
     
     analyzeCurrent() {
       if (this.currentImage) {
@@ -343,6 +429,137 @@ export default {
     
     formatTime(timestamp) {
       return new Date(timestamp).toLocaleTimeString();
+    },
+    
+    toggleChatBot() {
+      this.showChatBot = !this.showChatBot;
+      if (this.showChatBot) {
+        // Focus on input when chat opens
+        this.$nextTick(() => {
+          const input = this.$el.querySelector('.chat-input input');
+          if (input) input.focus();
+        });
+      }
+    },
+    
+    async sendMessage() {
+      if (!this.userMessage || !this.userMessage.trim() || this.isLoading) return;
+
+      const message = this.userMessage.trim();
+      this.userMessage = '';
+
+      // Add user message to chat
+      this.chatMessages.push({
+        role: 'user',
+        content: message,
+        timestamp: new Date().toISOString()
+      });
+
+      this.isLoading = true;
+      this.retryCount = 0;
+
+      try {
+        await this.attemptSendMessage(message);
+      } catch (error) {
+        console.error('Chat error:', error);
+        this.chatMessages.push({
+          role: 'assistant',
+          content: `Error: ${error.message}. Please try again.`,
+          timestamp: new Date().toISOString()
+        });
+      } finally {
+        this.isLoading = false;
+        
+        // Scroll to bottom
+        this.$nextTick(() => {
+          const container = this.$refs.chatMessages;
+          if (container) {
+            container.scrollTop = container.scrollHeight;
+          }
+        });
+      }
+    },
+    
+    async attemptSendMessage(message, retryCount = 0) {
+      try {
+        const botResponse = await this.callChatBot(message);
+        
+        // Add bot response to chat
+        this.chatMessages.push({
+          role: 'assistant',
+          content: botResponse,
+          timestamp: new Date().toISOString()
+        });
+        
+        // Reset retry count on success
+        this.retryCount = 0;
+      } catch (error) {
+        // Retry on network errors
+        if (retryCount < this.maxRetries && error.message.includes('network')) {
+          this.retryCount++;
+          await new Promise(resolve => setTimeout(resolve, 1000 * this.retryCount));
+          return this.attemptSendMessage(message, retryCount + 1);
+        }
+        throw error;
+      }
+    },
+    
+    async callChatBot(message) {
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            message: message,
+            context: this.currentAnalysis ? {
+              health_score: this.currentAnalysis.plant_analysis.health_score,
+              issues: this.currentAnalysis.plant_analysis.issues_detected || []
+            } : {}
+          })
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ error: `HTTP error! status: ${response.status}` }));
+          throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        if (data.error) {
+          throw new Error(data.error);
+        }
+        
+        return data.response;
+      } catch (error) {
+        console.error('Chat API Error:', error);
+        
+        // Provide more specific error messages
+        if (error.message.includes('Failed to fetch')) {
+          throw new Error('Cannot connect to the server. Please check your connection.');
+        } else if (error.message.includes('401') || error.message.includes('403')) {
+          throw new Error('Authentication error. Please check your API keys.');
+        } else {
+          throw error;
+        }
+      }
+    },
+    
+    checkApiStatus() {
+      fetch('/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ message: 'ping' })
+      })
+      .then(response => {
+        this.apiStatus = response.ok ? 'connected' : 'error';
+      })
+      .catch(() => {
+        this.apiStatus = 'disconnected';
+      });
     },
     
     showNotification(message, type = 'info') {
@@ -458,6 +675,14 @@ body {
   background-color: var(--gray-color);
   cursor: not-allowed;
 }
+.btn-secondary {
+  background-color: #6c757d;
+  color: white;
+}
+
+.btn-secondary:hover {
+  background-color: #5a6268;
+}
 
 .dashboard-container {
   display: grid;
@@ -483,7 +708,206 @@ body {
   font-size: 18px;
   color: var(--dark-color);
 }
+/* Add these styles to your CSS */
+.bot-toggle-btn {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  padding: 12px 16px;
+  background-color: var(--secondary-color);
+  color: white;
+  border: none;
+  border-radius: 50px;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  z-index: 100;
+  font-weight: 600;
+}
 
+.chat-bot-container {
+  position: fixed;
+  bottom: 80px;
+  right: 20px;
+  width: 350px;
+  height: 500px;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+  z-index: 1000;
+  overflow: hidden;
+}
+
+.chat-header {
+  padding: 15px;
+  background-color: var(--secondary-color);
+  color: white;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.chat-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.close-chat {
+  background: none;
+  border: none;
+  color: white;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-messages {
+  flex: 1;
+  padding: 15px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  max-width: 80%;
+}
+
+.message.user {
+  align-self: flex-end;
+}
+
+.message.assistant {
+  align-self: flex-start;
+}
+
+.message-content {
+  padding: 10px 14px;
+  border-radius: 18px;
+  word-wrap: break-word;
+}
+
+.message.user .message-content {
+  background-color: var(--primary-color);
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+
+.message.assistant .message-content {
+  background-color: #f1f1f1;
+  color: #333;
+  border-bottom-left-radius: 4px;
+}
+
+.message-time {
+  font-size: 10px;
+  color: #999;
+  margin-top: 4px;
+  padding: 0 8px;
+}
+
+.chat-input {
+  display: flex;
+  padding: 12px;
+  border-top: 1px solid #eee;
+  background: white;
+}
+
+.chat-input input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid #ddd;
+  border-radius: 20px;
+  outline: none;
+}
+
+.chat-input input:focus {
+  border-color: var(--primary-color);
+}
+.api-status {
+  position: fixed;
+  bottom: 10px;
+  left: 10px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  z-index: 1000;
+}
+
+.api-status.connected {
+  background-color: #4CAF50;
+  color: white;
+}
+
+.api-status.disconnected {
+  background-color: #F44336;
+  color: white;
+}
+
+.api-status.error {
+  background-color: #FF9800;
+  color: white;
+}
+
+.connection-status {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 10px;
+}
+
+.connection-status.connected {
+  background-color: #4CAF50;
+}
+
+.connection-status.disconnected {
+  background-color: #F44336;
+}
+
+.connection-status.error {
+  background-color: #FF9800;
+}
+
+.chat-input button {
+  margin-left: 8px;
+  padding: 10px 14px;
+  background-color: var(--secondary-color);
+  color: white;
+  border: none;
+  border-radius: 20px;
+  cursor: pointer;
+  min-width: 40px;
+}
+
+.chat-input button:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
+}
+
+/* Responsive design for mobile */
+@media (max-width: 768px) {
+  .chat-bot-container {
+    width: calc(100% - 40px);
+    right: 20px;
+    left: 20px;
+    height: 60vh;
+    bottom: 80px;
+  }
+  
+  .bot-toggle-btn {
+    bottom: 20px;
+    right: 20px;
+  }
+}
 /* Image container */
 .image-container {
   width: 100%;
@@ -806,6 +1230,31 @@ body {
     flex-direction: column;
     width: 100%;
   }
+  .confidence-indicator {
+  font-size: 14px;
+  color: #666;
+  margin-top: 10px;
+}
+
+.status-critical {
+  color: #e74c3c;
+  font-weight: bold;
+}
+
+.status-warning {
+  color: #f39c12;
+  font-weight: bold;
+}
+
+.status-normal {
+  color: #27ae60;
+  font-weight: bold;
+}
+
+.metric-status {
+  margin-top: 8px;
+  font-size: 12px;
+}
   
   .btn {
     width: 100%;
