@@ -21,7 +21,8 @@ import logging
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import threading
-
+import re 
+import openai
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,14 +35,112 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['CAPTURES_FOLDER'] = 'captures'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-CORS(app)
+# Restrict CORS for API endpoints to the frontend origin during development.
+# Adjust the origin/port if your dev server runs on a different port (e.g. 5173 for Vite).
+CORS(app, resources={
+    r"/api/*": {"origins": ["http://localhost:3000", "http://localhost:5000"]},
+    r"/socket.io/*": {"origins": ["http://localhost:3000", "http://localhost:5000"]}
+})
 
 # Configuration
 POE_API_CONFIG = {
     'api_key': os.getenv('POE_API_KEY'),
+    # Verify the Poe API base URL for your account/version. Some Poe endpoints
+    # may differ by model or API version. The code below uses '/chat/completions'.
     'base_url': 'https://api.poe.com/v1',
     'model': 'BotLPXCKK6G14'
 }
+# Add this near your other configurations
+POE_CHAT_CONFIG = {
+    'api_key': os.getenv('POE_CHAT_API_KEY'),  # You'll need to add this to your .env
+    # Same note: verify this base URL and endpoint path for the chat bot model.
+    'base_url': 'https://api.poe.com/v1',
+    'model': 'AgroSIEM'  # Replace with your second bot's model
+}
+@app.route('/api/chat', methods=['POST'])
+def chat_with_bot():
+    """Chat with the second Poe bot"""
+    try:
+        data = request.json
+        user_message = data.get('message', '')
+        context = data.get('context', {})
+        
+        if not user_message:
+            return jsonify({'error': 'No message provided'}), 400
+        
+        # Prepare the prompt with optional context
+        prompt = f"User question: {user_message}\n\n"
+        if context:
+            prompt += f"Context about the plant: Health score: {context.get('health_score', 'N/A')}, "
+            prompt += f"Issues detected: {', '.join(context.get('issues', [])) if context.get('issues') else 'None'}\n\n"
+        prompt += "Please provide a helpful response about plant care, diseases, or related topics."
+        
+        # Call the second Poe bot
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            response = loop.run_until_complete(call_second_poe_bot(prompt))
+        finally:
+            loop.close()
+        
+        return jsonify({'response': response})
+    
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+@app.route('/uploads/<filename>')
+def serve_uploaded_file(filename):
+    """Serve uploaded images"""
+    try:
+        return send_file(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+    except FileNotFoundError:
+        return jsonify({'error': 'File not found'}), 404
+
+@app.route('/captures/<filename>')
+def serve_captured_file(filename):
+    """Serve captured images from camera"""
+    try:
+        return send_file(os.path.join(app.config['CAPTURES_FOLDER'], filename))
+    except FileNotFoundError:
+        return jsonify({'error': 'File not found'}), 404
+async def call_second_poe_bot(prompt):
+    """Call the second Poe bot for chat responses"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                'Authorization': f'Bearer {POE_CHAT_CONFIG["api_key"]}',  # You'll need to add this config
+                'Content-Type': 'application/json'
+            }
+            
+            payload = {
+                "model": POE_CHAT_CONFIG['model'],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "temperature": 0.7,
+                "max_tokens": 1000
+            }
+            
+            async with session.post(
+                f"{POE_CHAT_CONFIG['base_url']}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result['choices'][0]['message']['content']
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Poe chat API error: {response.status} - {error_text}")
+                    return "I'm having trouble connecting right now. Please try again later."
+                    
+    except Exception as e:
+        logger.error(f"Error calling second Poe bot: {str(e)}")
+        return "Sorry, I encountered an error. Please try again."
 
 HEALTH_THRESHOLDS = {
     'soil_moisture': {'min': 40, 'max': 70, 'unit': '%', 'description': 'Soil water content percentage'},
@@ -67,49 +166,322 @@ auto_capture_interval = 300  # 5 minutes default
 # Ensure directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['CAPTURES_FOLDER'], exist_ok=True)
+# ... existing imports and setup code ...
 
+async def call_poe_api(image_base64):
+    """Call Poe API asynchronously with proper image handling"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                'Authorization': f'Bearer {POE_API_CONFIG["api_key"]}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Create a more detailed prompt for better analysis
+            prompt = """
+            Analyze this plant image thoroughly and provide a comprehensive health assessment.
+            
+            Please provide the following in JSON format:
+            1. health_score: A number between 0-100 representing overall plant health
+            2. analysis: Detailed analysis of visible conditions, including color, texture, signs of disease or stress
+            3. recommendations: Array of specific actionable recommendations for improvement
+            4. issues_detected: Array of any diseases, pests, or issues detected
+            5. plant_type: If identifiable, the type of plant
+            6. confidence: Confidence level of your analysis (0-100)
+            
+            Be specific and scientific in your assessment. Consider factors like:
+            - Leaf color and texture
+            - Signs of disease or pests
+            - Growth patterns
+            - Overall vitality indicators
+            """
+            
+            payload = {
+                "model": POE_API_CONFIG['model'],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.1,  # Lower temperature for more consistent results
+                "max_tokens": 2000
+            }
+            
+            async with session.post(
+                f"{POE_API_CONFIG['base_url']}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60)  # Increased timeout for image processing
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    analysis_text = result['choices'][0]['message']['content']
+                    
+                    # Clean the response text before parsing
+                    analysis_text = analysis_text.strip()
+                    
+                    # Remove markdown code blocks if present
+                    if analysis_text.startswith('```json'):
+                        analysis_text = analysis_text[7:]  # Remove ```json
+                    if analysis_text.startswith('```'):
+                        analysis_text = analysis_text[3:]  # Remove ```
+                    if analysis_text.endswith('```'):
+                        analysis_text = analysis_text[:-3]  # Remove ```
+                    
+                    # Try to parse JSON
+                    try:
+                        analysis_data = json.loads(analysis_text)
+                        
+                        # Validate the response structure
+                        if 'health_score' not in analysis_data:
+                            analysis_data['health_score'] = 50  # Default if missing
+                        
+                        if 'analysis' not in analysis_data:
+                            analysis_data['analysis'] = "Analysis completed but format was unexpected."
+                            
+                        if 'recommendations' not in analysis_data or not isinstance(analysis_data['recommendations'], list):
+                            analysis_data['recommendations'] = ["Monitor plant regularly"]
+                            
+                        if 'issues_detected' not in analysis_data or not isinstance(analysis_data['issues_detected'], list):
+                            analysis_data['issues_detected'] = []
+                            
+                        return analysis_data
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON parsing error: {e}. Response was: {analysis_text}")
+                        # Fallback parsing - extract key information from text response
+                        return parse_text_response(analysis_text)
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Poe API error: {response.status} - {error_text}")
+                    raise Exception(f"API error: {response.status}")
+                    
+    except Exception as e:
+        logger.error(f"Error calling Poe API: {str(e)}")
+        # Return fallback data with error indication
+        return {
+            "health_score": 50,
+            "analysis": f"Analysis failed: {str(e)}. Please try again.",
+            "recommendations": ["Check connection and try again", "Ensure proper lighting for capture"],
+            "issues_detected": ["Analysis error"],
+            "confidence": 0
+        }
+
+def parse_text_response(text):
+    """Fallback method to parse text responses when JSON parsing fails"""
+    # Try to extract a health score
+    health_score_match = re.search(r'health[_\s]score[:\s]*(\d+)', text, re.IGNORECASE)
+    health_score = int(health_score_match.group(1)) if health_score_match else 50
+    
+    # Try to extract recommendations
+    recommendations = []
+    if "recommend" in text.lower():
+        # Simple pattern matching for recommendations
+        lines = text.split('\n')
+        for line in lines:
+            if any(keyword in line.lower() for keyword in ['recommend', 'suggest', 'advise', 'should']):
+                recommendations.append(line.strip())
+    
+    if not recommendations:
+        recommendations = ["Increase monitoring frequency", "Check soil conditions"]
+    
+    # Try to detect issues
+    issues = []
+    issue_keywords = ['disease', 'pest', 'fungus', 'infection', 'deficiency', 'stress', 'problem', 'issue']
+    for keyword in issue_keywords:
+        if keyword in text.lower():
+            issues.append(f"Possible {keyword} detected")
+    
+    return {
+        "health_score": health_score,
+        "analysis": text,
+        "recommendations": recommendations,
+        "issues_detected": issues,
+        "confidence": 30  # Low confidence for parsed responses
+    }
+def analyze_image(image_path):
+    """Analyze plant image using Poe API with better error handling"""
+    try:
+        # Convert image to base64 with compression
+        img = cv2.imread(image_path)
+        
+        # Resize image if too large
+        height, width = img.shape[:2]
+        max_dimension = 1024
+        if width > max_dimension or height > max_dimension:
+            scale = max_dimension / max(width, height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        # Encode as JPEG
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+        _, buffer = cv2.imencode('.jpg', img, encode_param)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+        
+        # Call Poe API
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            analysis_data = loop.run_until_complete(
+                asyncio.wait_for(call_poe_api(img_base64), timeout=45)
+            )
+        except asyncio.TimeoutError:
+            logger.error("API call timed out")
+            analysis_data = {
+                "is_plant": False,
+                "error": "Analysis timed out",
+                "health_score": 50,
+                "analysis": "Analysis timed out. Please try again.",
+                "recommendations": ["Retry with better lighting"],
+                "issues_detected": ["Analysis timeout"]
+            }
+        finally:
+            loop.close()
+        
+        # Handle non-plant images
+        if not analysis_data.get('is_plant', True):
+            error_msg = analysis_data.get('error', 'No plant detected in image')
+            socketio.emit('analysis_error', {'error': error_msg})
+            # Show notification to user
+            socketio.emit('alerts', [{
+                'type': 'warning',
+                'message': error_msg,
+                'timestamp': datetime.now().isoformat()
+            }])
+            return
+        
+        # Generate sensor data for plant images only
+        sensor_data = generate_contextual_sensor_data(analysis_data)
+        
+        # Create complete analysis
+        complete_analysis = {
+            "timestamp": datetime.now().isoformat(),
+            "image_path": image_path,
+            "plant_analysis": analysis_data,
+            "sensor_data": sensor_data,
+            "confidence": analysis_data.get('confidence', 70)
+        }
+        
+        # Update global state
+        global current_analysis, analysis_history
+        current_analysis = complete_analysis
+        analysis_history.append(complete_analysis)
+        
+        # Keep only last 50 analyses
+        if len(analysis_history) > 50:
+            analysis_history = analysis_history[-50:]
+        
+        # Emit analysis results
+        socketio.emit('analysis_complete', complete_analysis)
+        
+        # Check for alerts
+        check_for_alerts(complete_analysis)
+        
+    except Exception as e:
+        logger.error(f"Error analyzing image: {str(e)}")
+        socketio.emit('analysis_error', {'error': str(e)})
+
+def generate_contextual_sensor_data(analysis_data):
+    """Generate sensor data that correlates with the visual analysis"""
+    import random
+    
+    health_score = analysis_data.get('health_score', 75)
+    issues = analysis_data.get('issues_detected', [])
+    
+    # Base values that correlate with health score
+    base_moisture = max(30, min(80, 50 + (health_score - 50) / 2))
+    base_ph = max(5.5, min(7.8, 6.5 + (health_score - 50) / 100))
+    
+    # Add variability but keep within reasonable ranges
+    return {
+        "soil_moisture": round(random.uniform(base_moisture - 10, base_moisture + 5), 1),
+        "ph_level": round(random.uniform(base_ph - 0.5, base_ph + 0.3), 1),
+        "nitrogen": round(random.uniform(15, 40), 1),
+        "phosphorus": round(random.uniform(5, 18), 1),
+        "potassium": round(random.uniform(25, 60), 1),
+        "temperature": round(random.uniform(18, 28), 1),
+        "humidity": round(random.uniform(40, 85), 1),
+        "light_intensity": round(random.uniform(200, 900), 0)
+    }
 # Camera functions integrated from camera.py
 def create_captures_folder():
     """Create the captures folder if it doesn't exist."""
     if not os.path.exists(app.config['CAPTURES_FOLDER']):
         os.makedirs(app.config['CAPTURES_FOLDER'])
         logger.info(f"Created '{app.config['CAPTURES_FOLDER']}' folder")
-
+# In app.py, improve the capture_image function
 def capture_image():
-    """Capture a single image from the webcam and return the filepath."""
+    """Capture a high-quality image from the webcam with better error handling"""
     cap = None
     try:
         # Try different camera indices
         for camera_index in [0, 1, 2]:
             cap = cv2.VideoCapture(camera_index)
             if cap.isOpened():
+                # Set camera properties for better quality
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+                cap.set(cv2.CAP_PROP_FOCUS, 0)
+                cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.5)
+                cap.set(cv2.CAP_PROP_CONTRAST, 0.5)
+                cap.set(cv2.CAP_PROP_SATURATION, 0.5)
+                
                 logger.info(f"Camera found at index {camera_index}")
                 break
-            cap.release()
+            else:
+                if cap:
+                    cap.release()
         
         if not cap or not cap.isOpened():
-            logger.error("Could not open any webcam")
+            logger.error("No camera detected or could not open any webcam")
             return None
         
-        # Allow camera to warm up
-        time.sleep(0.5)
+        # Allow camera to adjust to lighting
+        time.sleep(2)
         
-        # Read a frame from the webcam
-        ret, frame = cap.read()
+        # Capture multiple frames to get the best one
+        best_frame = None
+        best_focus = 0
         
-        if ret:
-            # Generate timestamp filename
+        for i in range(10):  # Capture more frames for better selection
+            ret, frame = cap.read()
+            if ret:
+                # Calculate focus measure
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                focus = cv2.Laplacian(gray, cv2.CV_64F).var()
+                
+                if focus > best_focus:
+                    best_focus = focus
+                    best_frame = frame.copy()
+            
+            time.sleep(0.1)
+        
+        if best_frame is not None:
+            # Generate filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"plant_{timestamp}.jpg"
             filepath = os.path.join(app.config['CAPTURES_FOLDER'], filename)
             
-            # Save the image
-            cv2.imwrite(filepath, frame)
-            logger.info(f"Captured image: {filename}")
+            # Save image with optimal settings
+            cv2.imwrite(filepath, best_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            logger.info(f"Captured image: {filename} (focus score: {best_focus:.2f})")
             
             return filepath
         else:
-            logger.error("Failed to capture image - no frame received")
+            logger.error("Failed to capture any valid frames")
             return None
             
     except Exception as e:
@@ -118,6 +490,49 @@ def capture_image():
     finally:
         if cap:
             cap.release()
+
+@app.route('/api/upload', methods=['POST'])
+def upload_image():
+    """Handle image file uploads"""
+    try:
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image file provided'}), 400
+        
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Validate file type
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid file type. Only images are allowed.'}), 400
+        
+        # Save the uploaded file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"upload_{timestamp}_{secure_filename(file.filename)}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        logger.info(f"Image uploaded: {filename}")
+        
+        # Process the image
+        executor.submit(process_image, filepath)
+        
+        return jsonify({
+            'success': True, 
+            'image_path': filepath,
+            'message': 'Image uploaded successfully'
+        })
+    
+    except Exception as e:
+        logger.error(f"Error uploading image: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+def allowed_file(filename):
+    """Check if the file is an allowed image type"""
+    allowed_extensions = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in allowed_extensions
+
 
 def auto_capture_loop():
     """Auto-capture loop running in background thread."""
@@ -357,13 +772,31 @@ def analyze_image(image_path):
         socketio.emit('analysis_error', {'error': str(e)})
 
 async def call_poe_api(image_base64):
-    """Call Poe API asynchronously"""
+    """Call Poe API with better plant detection to avoid false positives"""
     try:
         async with aiohttp.ClientSession() as session:
             headers = {
                 'Authorization': f'Bearer {POE_API_CONFIG["api_key"]}',
                 'Content-Type': 'application/json'
             }
+            
+            # More specific prompt to avoid analyzing non-plant images
+            prompt = """
+            Analyze this image ONLY if it contains plants or vegetation. 
+            If this is not a plant image (e.g., person, object, empty background), 
+            respond with: {"is_plant": false, "error": "No plant detected in image"}
+            
+            If this is a plant image, provide a comprehensive health assessment with:
+            1. health_score: 0-100
+            2. analysis: Detailed analysis
+            3. recommendations: Array of specific recommendations
+            4. issues_detected: Array of any issues
+            5. plant_type: If identifiable
+            6. confidence: 0-100
+            7. is_plant: true
+            
+            Format your response as valid JSON.
+            """
             
             payload = {
                 "model": POE_API_CONFIG['model'],
@@ -373,7 +806,7 @@ async def call_poe_api(image_base64):
                         "content": [
                             {
                                 "type": "text",
-                                "text": "Analyze this plant image for health assessment. Provide: 1) Overall health score (0-100), 2) Detailed analysis of visible conditions, 3) Specific recommendations for improvement, 4) Any diseases or issues detected. Format as JSON with keys: health_score, analysis, recommendations (array), issues_detected (array)."
+                                "text": prompt
                             },
                             {
                                 "type": "image_url",
@@ -383,30 +816,59 @@ async def call_poe_api(image_base64):
                             }
                         ]
                     }
-                ]
+                ],
+                "temperature": 0.1,
+                "max_tokens": 2000
             }
             
             async with session.post(
                 f"{POE_API_CONFIG['base_url']}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 if response.status == 200:
                     result = await response.json()
                     analysis_text = result['choices'][0]['message']['content']
                     
-                    # Try to parse JSON
+                    # Clean and parse response
+                    analysis_text = analysis_text.strip()
+                    if analysis_text.startswith('```json'):
+                        analysis_text = analysis_text[7:]
+                    if analysis_text.startswith('```'):
+                        analysis_text = analysis_text[3:]
+                    if analysis_text.endswith('```'):
+                        analysis_text = analysis_text[:-3]
+                    
                     try:
-                        return json.loads(analysis_text)
-                    except json.JSONDecodeError:
-                        # Fallback parsing
-                        return {
-                            "health_score": 75,
-                            "analysis": analysis_text,
-                            "recommendations": ["Monitor plant regularly", "Ensure proper watering"],
-                            "issues_detected": []
-                        }
+                        analysis_data = json.loads(analysis_text)
+                        
+                        # Check if plant was detected
+                        if analysis_data.get('is_plant') == False:
+                            return {
+                                "is_plant": False,
+                                "error": analysis_data.get('error', 'No plant detected in image')
+                            }
+                        
+                        # Validate required fields for plant analysis
+                        if 'health_score' not in analysis_data:
+                            analysis_data['health_score'] = 50
+                        
+                        if 'analysis' not in analysis_data:
+                            analysis_data['analysis'] = "Analysis completed but format was unexpected."
+                            
+                        if 'recommendations' not in analysis_data or not isinstance(analysis_data['recommendations'], list):
+                            analysis_data['recommendations'] = ["Monitor plant regularly"]
+                            
+                        if 'issues_detected' not in analysis_data or not isinstance(analysis_data['issues_detected'], list):
+                            analysis_data['issues_detected'] = []
+                            
+                        analysis_data['is_plant'] = True
+                        return analysis_data
+                        
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON parsing error: {e}. Response: {analysis_text}")
+                        return parse_text_response(analysis_text)
                 else:
                     error_text = await response.text()
                     logger.error(f"Poe API error: {response.status} - {error_text}")
@@ -414,14 +876,15 @@ async def call_poe_api(image_base64):
                     
     except Exception as e:
         logger.error(f"Error calling Poe API: {str(e)}")
-        # Return fallback data
         return {
-            "health_score": 75,
-            "analysis": f"Analysis failed: {str(e)}",
-            "recommendations": ["Check connection and try again"],
+            "is_plant": False,
+            "error": f"Analysis failed: {str(e)}",
+            "health_score": 50,
+            "analysis": "Analysis error occurred",
+            "recommendations": ["Try again with a clearer plant image"],
             "issues_detected": ["Analysis error"]
         }
-
+    
 def generate_mock_sensor_data():
     """Generate mock sensor data"""
     import random
